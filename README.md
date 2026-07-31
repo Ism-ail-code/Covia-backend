@@ -3,20 +3,24 @@
 Backend foundation for **Covia** — a mobile app that coordinates shared rides
 booked through third-party ride-hailing services (Uber, Bolt, Careem, inDrive).
 
-This repository currently contains **Phase 1: infrastructure only** plus the
+This repository currently contains **Phase 1: infrastructure** plus the
 **Phase 2 Supabase support** (auth schema + setup guide), **Phase 3 user
 profiles** (identity fields, username rules, public/private profile model,
-avatar storage) and **Phase 4 identity verification** (government ID +
-student checks, private document storage, admin review functions). No product
-features (rides, chats, payments) are implemented yet; the architecture,
-tooling, and conventions below are in place to build them on.
+avatar storage), **Phase 4 identity verification** (government ID +
+student checks, private document storage, admin review functions) and
+**Phase 5 ride management & matching** (ride lifecycle, request/approval
+workflow, capacity + overlap enforcement, search/discovery, timeline).
+Ride **screens** are not wired yet; the backend RPCs, mobile service layer
+and documentation are in place. Chat, ratings and payments remain future
+phases.
 
-> Authentication and profiles for the mobile app run on **Supabase** (Auth +
-> Postgres + Storage). This repo ships the schema (`supabase/migrations/`),
-> a local SQL smoke test (`scripts/sql-smoke.mjs`) and the setup guide
-> (`docs/SUPABASE_SETUP.md`). See `docs/DATABASE_SCHEMA.md` for the full
-> schema reference. The NestJS API will serve business endpoints in later
-> phases.
+> Authentication, profiles and the ride layer for the mobile app run on
+> **Supabase** (Auth + Postgres + Storage). This repo ships the schema
+> (`supabase/migrations/`), a local SQL smoke test
+> (`scripts/sql-smoke.mjs`) and the setup guide (`docs/SUPABASE_SETUP.md`).
+> See `docs/DATABASE_SCHEMA.md` for the full schema reference and
+> `docs/API_DOCUMENTATION.md` for the ride RPC reference. The NestJS API
+> will serve chat/ratings endpoints in later phases.
 
 ## Stack
 
@@ -107,7 +111,7 @@ migrations:
 
 ```bash
 pnpm db:dev:start          # boot the database (terminal)
-node scripts/sql-smoke.mjs # apply supabase/migrations/* to a scratch DB + assert
+node scripts/sql-smoke.mjs # apply supabase/migrations/* to a scratch DB + assert (246 checks)
 ```
 
 ## Repository layout

@@ -66,7 +66,7 @@ companion://reset
      (carrying `full_name` / `phone` from signup metadata).
    - Row Level Security: users can select/update **only their own** row.
 
-2. Run the Phase 3 & 4 migrations in order:
+2. Run the Phase 3–5 migrations in order:
 
    - `supabase/migrations/0002_profile_identity.sql` — identity fields
      (username, DOB, gender, country), ride-metric placeholders, emergency
@@ -85,10 +85,23 @@ companion://reset
      RPCs: submit / resubmit / get my submission / `is_user_verified`.
    - `supabase/migrations/0008_verification_admin_functions.sql` — admin
      RPCs: review queue + approve/reject/request-resubmission.
+   - `supabase/migrations/0009_rides_schema.sql` — `rides`,
+     `ride_requests`, `ride_participants`, `ride_timeline` + RLS
+     (`is_ride_member()` helper).
+   - `supabase/migrations/0010_rides_creation_functions.sql` —
+     `create_ride` / `publish_ride` / `update_ride`.
+   - `supabase/migrations/0011_rides_request_functions.sql` — request
+     workflow: `request_to_join` / `cancel_ride_request` / `leave_ride` /
+     `host_respond_to_request`.
+   - `supabase/migrations/0012_rides_lifecycle_functions.sql` —
+     `start_ride` / `complete_ride` / `cancel_ride`.
+   - `supabase/migrations/0013_rides_read_functions.sql` — `search_rides`
+     / `get_ride` / `get_ride_requests` / `get_ride_participants` /
+     `get_ride_timeline`.
 
    Local SQL can be smoke-tested against the embedded PostgreSQL before
    applying anywhere: `node scripts/sql-smoke.mjs` (database must be
-   running — `pnpm db:dev:start`).
+   running — `pnpm db:dev:start`). **246 checks cover Phases 1–5.**
 
 3. Verify with:
 
@@ -167,6 +180,47 @@ companion://reset
 - [ ] Documents are invisible to everyone except the owner and admins
       (private bucket); render via `createSignedUrl` client-side, or the
       service-role key server-side for admins.
+
+### Phase 5 — ride checks
+
+Requires two users: one **verified** host and one **verified**
+passenger (approve their verification first), plus one unverified user.
+
+- [ ] Unverified users cannot create rides or request seats (friendly
+      "verify first" message).
+- [ ] Verified host creates a ride → `ride_status = 'draft'` with
+      `available_seats = total_seats`; past departures, empty fields, seat
+      counts outside 1–10, and missing/invalid fares are rejected.
+- [ ] Student-only rides: rejected for non-students, allowed for verified
+      students.
+- [ ] `publish_ride` → status `published`; the host appears in
+      `get_ride_participants` as `Host`; republishing is rejected.
+- [ ] Passenger requests → `pending`; a second request is rejected
+      (duplicate); requesting your own ride / a draft / a full / a started /
+      a cancelled ride is rejected.
+- [ ] Overlap guard: a passenger already on a ride (or with a pending
+      request) cannot request another ride departing within **6 hours**.
+- [ ] Host approves → request `approved`, passenger added, seats
+      decremented; last seat → `full` and further approvals refused.
+- [ ] Host rejects with a reason → `rejected`; passenger sees the reason.
+- [ ] Passenger withdraws a pending request; a passenger on the ride can
+      `leave_ride` before departure (seat freed, ride re-opens from `full`).
+- [ ] Host edits: past departure / seats below approved passengers are
+      rejected; seat changes restatus `full`/`published` correctly.
+- [ ] `start_ride` → `in_progress` (host only); `complete_ride` →
+      `completed` and `total_completed_rides` increments for host +
+      passengers; `cancel_ride` (pre-start) → `cancelled`, pending requests
+      closed, `total_cancelled_rides` incremented; no double cancels or
+      cancels after start.
+- [ ] `search_rides` returns only published/full rides and honours origin/
+      destination/date/time/seat/student/women filters, sorts
+      (departure/recent/distance) and pagination (`total_count` matches).
+- [ ] `get_ride` hides drafts from non-hosts; `get_ride_requests` is
+      host-only; participants/timeline are member-only.
+- [ ] Direct `insert`/`update` on ride tables fails (select-only grants).
+- [ ] Timeline shows the full event sequence for a ride
+      (created → published → requested → approved → joined → ride_full →
+      … started → completed / cancelled).
 
 ## Notes & security
 

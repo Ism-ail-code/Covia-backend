@@ -1,9 +1,9 @@
 # Covia — Database Schema
 
-Auth and profiles live in **Supabase** (managed PostgreSQL). The NestJS
-service owns business tables (rides, chat, ratings — future phases) in its
-own PostgreSQL database; the schema below is applied to Supabase via the
-files in `supabase/migrations/`.
+Auth, profiles and the **ride coordination layer** live in **Supabase**
+(managed PostgreSQL). The NestJS service owns business tables (chat,
+ratings — future phases) in its own PostgreSQL database; the schema
+below is applied to Supabase via the files in `supabase/migrations/`.
 
 Migrations (apply in order, in the Supabase SQL Editor):
 
@@ -17,6 +17,11 @@ Migrations (apply in order, in the Supabase SQL Editor):
 | `0006_verification_storage.sql` | private `verification-documents` Storage bucket + owner/admin policies |
 | `0007_verification_user_functions.sql` | user RPCs: submit/resubmit/get my submission/is verified |
 | `0008_verification_admin_functions.sql` | admin RPCs: review queue + approve/reject/resubmission review |
+| `0009_rides_schema.sql` | `rides`, `ride_requests`, `ride_participants`, `ride_timeline` + RLS |
+| `0010_rides_creation_functions.sql` | `create_ride`, `publish_ride`, `update_ride` |
+| `0011_rides_request_functions.sql` | request/approval workflow: `request_to_join`, `cancel_ride_request`, `leave_ride`, `host_respond_to_request` |
+| `0012_rides_lifecycle_functions.sql` | `start_ride`, `complete_ride`, `cancel_ride` |
+| `0013_rides_read_functions.sql` | `search_rides`, `get_ride`, `get_ride_requests`, `get_ride_participants`, `get_ride_timeline` |
 
 ## `public.profiles`
 
@@ -40,8 +45,8 @@ One row per user. The primary key **is** the `auth.users` id (uuid,
 | verification_status | text | `Pending` / `In Review` / `Verified` / `Rejected` (default `Pending`) |
 | rating | numeric(2,1) | default 5.0; 0–5 |
 | reliability_score | integer | default 90; 0–100 |
-| total_completed_rides | integer | default 0 — placeholder for Phase 4 |
-| total_cancelled_rides | integer | default 0 — placeholder for Phase 4 |
+| total_completed_rides | integer | default 0 — incremented by `complete_ride` (Phase 5) |
+| total_cancelled_rides | integer | default 0 — incremented by `cancel_ride` (Phase 5) |
 | is_government_id_verified | boolean | default false |
 | is_student_verified | boolean | default false |
 | emergency_contact_name | text | all-or-nothing with the two below |
@@ -204,6 +209,154 @@ Admin side (security definer, guarded by `is_admin()`, `authenticated` only):
   - admins: must use a service-role client (NestJS admin API, future phase)
     — the anon key cannot sign URLs for other users' documents.
 
+## Ride coordination (0009–0013)
+
+Phase 5 feature: verified travellers coordinate seats on a shared
+vehicle. Covia is **not** ride-hailing — it only manages bookings on
+rides whose transport is booked elsewhere (Uber/inDrive/Yango). The
+whole lifecycle below lives in Supabase RPCs; the NestJS service is not
+involved.
+
+### Lifecycle
+
+```
+draft → published → full → in_progress → completed
+    \       \        \     \→ cancelled
+     \      \→ cancelled
+      \→ cancelled
+```
+
+| Status | Meaning | Entered via |
+| --- | --- | --- |
+| `draft` | created but invisible; host editing area | `create_ride` |
+| `published` | visible in search, accepting requests | `publish_ride` |
+| `full` | all seats taken; still accepting (→ rejected) requests | last approval / seat edit |
+| `in_progress` | departed | `start_ride` (host) |
+| `completed` | finished; reliability counters updated | `complete_ride` (host) |
+| `cancelled` | host cancelled pre-start; open requests closed | `cancel_ride` (host) |
+
+Rules enforced in the functions (0010–0012):
+
+- Only **verified users** create rides / request seats
+  (`is_user_verified()` — any approved method); verified **students**
+  only may create `student_only` rides.
+- Departure must be in the future; seats 1–10; pickup point required;
+  `fixed` fares need a per-seat amount, `smart` fares must not have one.
+- Seat edits cannot drop below the approved passenger headcount.
+- Requests: pending-only duplicates rejected (23505), hosts cannot
+  request their own ride, no **overlapping rides** — an active seat or
+  pending request on another ride departing within **6 hours** blocks
+  the request (departed/cancelled/completed rides don't count, and a
+  passenger who left frees the window).
+- Approvals enforce capacity: the last seat flips the ride to `full`;
+  further approvals are refused. Leaving a ride frees the seat and
+  re-opens a full ride.
+- Editing is host-only and stops once the ride starts; cancellations
+  are host-only, pre-start only, recorded forever (reliability
+  scoring), and close pending requests.
+- `complete_ride` increments `total_completed_rides` for the host and
+  every passenger who stayed; `cancel_ride` increments
+  `total_cancelled_rides` for the host.
+
+### `public.rides`
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| id | uuid PK | `gen_random_uuid()` |
+| host_id | uuid FK → auth.users | owner; `on delete cascade` |
+| origin / destination | text | 1–120 chars, trimmed |
+| pickup_point / destination_point | text | 1–160 chars (destination optional) |
+| origin_lat / lng, destination_lat / lng | numeric(9,6) | optional — geocoding is a later phase |
+| departure_time | timestamptz | must be in the future when created/edited |
+| estimated_arrival | timestamptz | > departure_time |
+| total_seats | integer | 1–10 |
+| available_seats | integer | 0–total |
+| fare_mode | text | `fixed` / `smart` |
+| fixed_fare | numeric(10,2) | required when `fixed`, forbidden when `smart` |
+| ride_status | text | lifecycle above; default `draft` |
+| is_student_only / is_women_only | boolean | filters, not hard gates (women-only is a preference, not enforcement) |
+| notes | text | ≤ 1000 chars |
+| created_at / updated_at | timestamptz | `updated_at` via `set_updated_at()` trigger |
+
+Indexes: `(ride_status, departure_time)`, origin, destination, host_id,
+student/women flags.
+
+### `public.ride_requests`
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| id | uuid PK | |
+| ride_id | uuid FK → rides | `on delete cascade` |
+| passenger_id | uuid FK → auth.users | `on delete cascade` |
+| status | text | `pending` / `approved` / `rejected` / `cancelled` |
+| requested_at / responded_at | timestamptz | response time set on any non-pending outcome |
+
+Partial unique index `(ride_id, passenger_id) where status = 'pending'`
+— one open request per (ride, passenger).
+
+### `public.ride_participants`
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| ride_id + user_id | PK (both FK, cascade) | |
+| role | text | `Host` (added on publish) / `Passenger` (added on approval) |
+| joined_at / left_at | timestamptz | `left_at` marks pre-start departures |
+
+### `public.ride_timeline`
+
+Every event, timestamped — powers the activity feed and notifications
+in later phases. Columns: `id`, `ride_id` (FK, cascade), `event_type`
+(one of 13 values), `actor_id` (FK → auth.users, set null on delete),
+`metadata` jsonb, `created_at`.
+
+Event types: `created`, `published`, `requested`, `request_cancelled`,
+`approved`, `rejected`, `joined`, `left`, `ride_full`, `edited`,
+`started`, `completed`, `cancelled`. Written only by the security
+definer `record_ride_event(ride_id, event, actor, metadata)` helper
+(revoked from `public`).
+
+### Row Level Security
+
+- Tables are readable only via the `authenticated` role (no client
+  writes anywhere — grants are `select`-only, everything else runs
+  through security definer functions).
+- `rides` — host sees own; participants (via `is_ride_member()`)
+  see their ride; everyone sees non-draft rides.
+- `ride_requests` — passenger sees own, host sees requests on their
+  rides.
+- `ride_participants` — only ride members (via `is_ride_member()`).
+- `ride_timeline` — host or members.
+- `is_ride_member(ride_id, user_id)` is a security definer helper so
+  policies don't recurse into `ride_participants`.
+
+### Functions
+
+Write side (security definer, `authenticated` only; every mutation
+writes timeline events):
+
+| Function | Purpose |
+| --- | --- |
+| `create_ride(p_origin, p_destination, p_pickup_point, p_departure_time, p_total_seats, p_fare_mode, p_fixed_fare, p_notes, p_destination_point, p_is_student_only, p_is_women_only, p_estimated_arrival)` | validated draft ride (verified host only) |
+| `publish_ride(p_ride_id)` | draft → published; host joins as participant |
+| `update_ride(p_ride_id, p_departure_time, p_pickup_point, p_notes, p_total_seats, p_fare_mode, p_fixed_fare)` | host edits pre-start; seat floor + auto `full`/`published` restatus |
+| `request_to_join(p_ride_id)` | verified passenger request; duplicates 23505, overlap checks |
+| `cancel_ride_request(p_request_id)` | passenger withdraws a pending request |
+| `leave_ride(p_ride_id)` | passenger leaves pre-start; seat freed, `full` → `published` |
+| `host_respond_to_request(p_request_id, p_approve, p_reason)` | approve (capacity-checked, adds participant, last seat → `full` + `ride_full` event) or reject with reason |
+| `start_ride(p_ride_id)` | published/full → in_progress (host) |
+| `complete_ride(p_ride_id)` | in_progress → completed; increments reliability counters |
+| `cancel_ride(p_ride_id)` | pre-start cancel (host); closes pending requests, records counter |
+
+Read side (security definer, `authenticated` only):
+
+| Function | Purpose |
+| --- | --- |
+| `search_rides(p_origin, p_destination, p_date, p_time_from, p_available_seats, p_student_only, p_women_only, p_sort, p_origin_lat, p_origin_lng, p_page, p_page_size)` | published/full rides only; ILIKE filters; sort departure/recent/distance (haversine, nulls last when no coordinates); `total_count` via window; pagination (page size ≤ 50) |
+| `get_ride(p_ride_id)` | detail + host public profile; drafts visible only to the host; otherwise "Ride not found" |
+| `get_ride_requests(p_ride_id)` | host-only request queue with passenger public profiles |
+| `get_ride_participants(p_ride_id)` | members-only roster (Host first) |
+| `get_ride_timeline(p_ride_id)` | members-only chronological events with actor names |
+
 ## Mobile model mapping
 
 - `src/types/profile.ts` — `UserProfile` (private) and `PublicProfile`
@@ -219,3 +372,10 @@ Admin side (security definer, guarded by `is_admin()`, `authenticated` only):
 - `app/(app)/verification.tsx` — Government ID / Student ID flows: upload
   tiles per document, kind + method selectors, live status cards
   (pending / approved / rejected with reason / expired), resubmission.
+- `src/types/ride.ts` — `Ride`, `RideRequest`, `RideParticipant`,
+  `RideTimelineEvent`, status/event/fare label maps, search filters.
+- `src/services/rides.ts` — every write RPC (create/publish/update/
+  request/cancel-request/leave/respond/start/complete/cancel) + the read
+  functions (search/get/requests/participants/timeline), client-side
+  `validateRideInput`, friendly `RideError` mapping. Numeric columns
+  (numeric/bigint) are cast from strings.

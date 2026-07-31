@@ -5,6 +5,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+### Phase 5 — Ride management & matching
+
+- `supabase/migrations/0009_rides_schema.sql` — `rides` (statuses
+  draft/published/full/in_progress/completed/cancelled, fare modes
+  fixed/smart, seat + point + time checks, search indexes), `ride_requests`
+  (manual approval workflow, one-pending partial unique index),
+  `ride_participants` (Host/Passenger, `left_at`), `ride_timeline` (13
+  event types, metadata) + security definer `record_ride_event` helper;
+  RLS — select-only grants, `is_ride_member()` helper so policies don't
+  recurse.
+- `supabase/migrations/0010_rides_creation_functions.sql` — `create_ride`
+  (verified hosts only, full validation), `publish_ride` (draft →
+  published, host joins as participant), `update_ride` (host, pre-start,
+  seat floor, auto full/published restatus, `edited` events only on
+  change).
+- `supabase/migrations/0011_rides_request_functions.sql` — `request_to_join`
+  (verified only, no own ride, duplicates 23505, no overlapping rides
+  within 6h — active seats + pending requests), `cancel_ride_request`,
+  `leave_ride` (pre-start, frees the seat), `host_respond_to_request`
+  (capacity-checked approval, last seat → `full` + `ride_full` event,
+  rejection reason).
+- `supabase/migrations/0012_rides_lifecycle_functions.sql` — `start_ride`,
+  `complete_ride` (increments `total_completed_rides` for host + staying
+  passengers), `cancel_ride` (pre-start, no double cancel, closes pending
+  requests, increments `total_cancelled_rides`).
+- `supabase/migrations/0013_rides_read_functions.sql` — `search_rides`
+  (published/full only, ILIKE filters, date/time/seats/student/women
+  filters, departure/recent/distance sort with haversine + nulls-last
+  fallback, pagination ≤ 50, `total_count` window, host profile joins),
+  `get_ride` (drafts host-only), `get_ride_requests` (host queue),
+  `get_ride_participants` (members), `get_ride_timeline` (members).
+- `scripts/sql-smoke.mjs` — Phase 5 assertions: schema/grants, verified
+  gates, creation validations, publish/republish, request/approve/reject/
+  withdraw, overlap + duplicate + capacity rules, seat floor, lifecycle
+  transitions incl. invalid ones, counter updates, timeline event sets,
+  search filters/sort/pagination, RPC member gating, direct-write
+  blocking. **246/246 pass** (Phases 1–4 + 5).
+- `docs/DATABASE_SCHEMA.md` — ride tables, lifecycle matrix, RLS and
+  functions documented; `docs/API_DOCUMENTATION.md` — RPC reference with
+  permissions, statuses and error conventions.
+
 ### Phase 1 — Infrastructure (in progress)
 
 - NestJS 11 application scaffolded with pnpm, strict TypeScript.
