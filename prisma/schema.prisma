@@ -1,0 +1,15 @@
+// Covia Prisma schema — Phase 1: infrastructure only.
+// Application models (users, rides, chats, …) are added in later phases.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "commonjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// NOTE: The database connection URL is defined in prisma.config.ts
+// (loaded from DATABASE_URL in the environment).

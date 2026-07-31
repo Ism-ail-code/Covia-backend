@@ -1,0 +1,30 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+
+# Environment variables — NEVER commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Prisma
+# Generated client is rebuilt via `pnpm prisma:generate` (postinstall).
+src/generated
+
+# Local embedded development database
+.local
+
+# Logs
+*.log
+logs
+
+# Test coverage
+coverage
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store

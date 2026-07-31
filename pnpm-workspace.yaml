@@ -1,0 +1,6 @@
+allowBuilds:
+  '@embedded-postgres/windows-x64': true
+  '@prisma/engines': true
+  '@scarf/scarf': false
+  prisma: true
+  unrs-resolver: true
