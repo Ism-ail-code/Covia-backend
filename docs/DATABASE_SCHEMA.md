@@ -13,6 +13,10 @@ Migrations (apply in order, in the Supabase SQL Editor):
 | `0002_profile_identity.sql` | identity fields, username rules, emergency contacts, reserved usernames |
 | `0003_public_profiles.sql` | `public_profiles` view + lookup/search/availability functions |
 | `0004_avatars_storage.sql` | `avatars` Storage bucket + object policies |
+| `0005_verification_schema.sql` | `verification_submissions` + audit trail, `admin_users`, `notification_events`, RLS |
+| `0006_verification_storage.sql` | private `verification-documents` Storage bucket + owner/admin policies |
+| `0007_verification_user_functions.sql` | user RPCs: submit/resubmit/get my submission/is verified |
+| `0008_verification_admin_functions.sql` | admin RPCs: review queue + approve/reject/resubmission review |
 
 ## `public.profiles`
 
@@ -111,6 +115,95 @@ granted only to `authenticated`.
   anon + authenticated.
 - The app stores only the public URL in `profiles.avatar_url`.
 
+## Identity verification (0005–0008)
+
+Phase 4 feature: users prove identity with a **government ID** (national ID,
+driver's licence or passport — front, optional back, optional selfie) or
+**student status** (student card photo OR university email). Review is done
+by admins via SQL/RPC; there is no admin UI yet.
+
+### `public.verification_submissions`
+
+One row per verification attempt (an account can have a history — only one
+active row per type thanks to a partial unique index).
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| id | uuid PK | default `gen_random_uuid()` |
+| user_id | uuid FK → auth.users | `on delete cascade` |
+| verification_type | text | `government_id` / `student` |
+| government_id_kind | text | `national_id` / `drivers_license` / `passport` (required for government ID) |
+| status | text | `pending` / `approved` / `rejected` / `expired` / `resubmission_requested` |
+| submitted_at | timestamptz | set when (re)submitted |
+| reviewed_at / reviewed_by | timestamptz / uuid | set by the reviewing admin |
+| rejection_reason | text | admin's reason (shown to the user) |
+| front_document_url | text | **object path** in `verification-documents`, required for government ID |
+| back_document_url / selfie_url | text | optional paths |
+| student_card_url / university_email | text | student evidence — at least one required |
+| created_at / updated_at | timestamptz | `updated_at` kept fresh by trigger |
+
+Constraints: per-type evidence checks, path length ≤ 500, email format,
+partial unique index `(user_id, verification_type)` where status in
+(`pending`, `approved`, `resubmission_requested`) — blocks duplicate
+submissions while one is live.
+
+### Other tables
+
+- `public.verification_audit` — immutable trail: `submission_id`, `action`
+  (`submitted`/`approved`/`rejected`/`resubmission_requested`/`expired`),
+  `performed_by`, `reason`, `created_at`. Written only by the security
+  definer functions.
+- `public.admin_users` — `user_id` PK → auth.users. Adding a row makes that
+  user an admin. **There is no UI for this — an owner runs
+  `insert into public.admin_users (user_id) values ('<uuid>');` in the SQL
+  Editor.**
+- `public.notification_events` — placeholder inbox: `user_id`, `event_type`
+  (`verification.submitted` / `.approved` / `.rejected` /
+  `.resubmission_requested`), `payload` jsonb, `read_at`. The real
+  notifications module will consume/replace this.
+
+### Row Level Security
+
+- No direct client writes to any of the four tables — all writes go through
+  security definer functions (grants revoked from `public`, `select` granted
+  to `authenticated` for submissions, audit and notifications).
+- Users read only their own submissions and notification events; admins
+  (via `public.is_admin()`) additionally read all submissions, the audit
+  trail and all notifications.
+
+### Functions
+
+User side (security definer, `authenticated` only):
+
+| Function | Purpose |
+| --- | --- |
+| `submit_verification(p_verification_type, p_front_document_url, p_back_document_url, p_selfie_url, p_student_card_url, p_university_email, p_government_id_kind)` | start a check; validates evidence, rejects duplicates (23505), writes audit + notification, returns the row |
+| `resubmit_verification(p_submission_id, …same evidence args…)` | re-upload after `rejected`/`resubmission_requested`; only the owner may call it |
+| `get_my_verification(p_verification_type)` | caller's latest submission for one type (or null) |
+| `is_user_verified()` | boolean — true once **any** type is approved; the gate for ride creation/joining |
+
+Admin side (security definer, guarded by `is_admin()`, `authenticated` only):
+
+| Function | Purpose |
+| --- | --- |
+| `is_admin()` | membership check against `admin_users` (used by RLS policies too) |
+| `admin_list_verifications(p_status text default 'pending')` | review queue with `user_email` / `user_display_name` joined in; `'all'` returns everything |
+| `admin_review_verification(p_submission_id, p_action, p_reason)` | `approve` / `reject` / `request_resubmission`; only `pending` rows; approve flips `profiles.verification_status` → `Verified` + the matching `is_government_id_verified` / `is_student_verified` flag; writes audit + notification. Reject requires a reason |
+
+### Storage (`verification-documents` bucket)
+
+- **Private** bucket (`public = false`), `file_size_limit` 10 MB,
+  `allowed_mime_types` jpeg/png/webp.
+- Object paths: `verification/<user-id>/<slot>-<timestamp>.<ext>` — policies
+  key on the first two path segments.
+- Policies: insert/update/delete only into one's own folder; **read** by the
+  owner **and admins** (everyone else — nothing).
+- The app stores only the object **path** on the submission. Owners and
+  admins render documents with **signed URLs** generated on demand:
+  - owners: `supabase.storage.from(...).createSignedUrl(path, 3600)` client-side
+  - admins: must use a service-role client (NestJS admin API, future phase)
+    — the anon key cannot sign URLs for other users' documents.
+
 ## Mobile model mapping
 
 - `src/types/profile.ts` — `UserProfile` (private) and `PublicProfile`
@@ -118,3 +211,11 @@ granted only to `authenticated`.
 - `src/services/profiles.ts` — fetch/ensure/update, username ops,
   emergency contact ops, `getPublicProfile`, `searchProfiles`.
 - `src/services/storage.ts` — avatar upload/replace/delete + validation.
+- `src/types/verification.ts` — `VerificationSubmission`, status lifecycle,
+  ID kinds, `VerificationDraft`.
+- `src/services/verification.ts` — document upload to the private bucket,
+  submit/resubmit/get-my-verification RPC calls, `isUserVerified()` gate,
+  friendly error mapping.
+- `app/(app)/verification.tsx` — Government ID / Student ID flows: upload
+  tiles per document, kind + method selectors, live status cards
+  (pending / approved / rejected with reason / expired), resubmission.

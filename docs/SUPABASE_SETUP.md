@@ -66,7 +66,7 @@ companion://reset
      (carrying `full_name` / `phone` from signup metadata).
    - Row Level Security: users can select/update **only their own** row.
 
-2. Run the Phase 3 migrations in order:
+2. Run the Phase 3 & 4 migrations in order:
 
    - `supabase/migrations/0002_profile_identity.sql` — identity fields
      (username, DOB, gender, country), ride-metric placeholders, emergency
@@ -77,6 +77,14 @@ companion://reset
      functions.
    - `supabase/migrations/0004_avatars_storage.sql` — the public `avatars`
      Storage bucket with folder-scoped RLS policies.
+   - `supabase/migrations/0005_verification_schema.sql` — verification
+     submissions, audit trail, `admin_users`, notification placeholders.
+   - `supabase/migrations/0006_verification_storage.sql` — the **private**
+     `verification-documents` bucket (owner uploads, admin reads).
+   - `supabase/migrations/0007_verification_user_functions.sql` — user
+     RPCs: submit / resubmit / get my submission / `is_user_verified`.
+   - `supabase/migrations/0008_verification_admin_functions.sql` — admin
+     RPCs: review queue + approve/reject/request-resubmission.
 
    Local SQL can be smoke-tested against the embedded PostgreSQL before
    applying anywhere: `node scripts/sql-smoke.mjs` (database must be
@@ -131,6 +139,34 @@ companion://reset
 - [ ] `search_profiles('ali')` finds `alice_example`.
 - [ ] Direct table access as another user returns only your own row
       (RLS) — verified by `scripts/sql-smoke.mjs`.
+
+### Phase 4 — verification checks
+
+- [ ] Verification screen: submit a government ID (kind selector + front
+      photo required, back/selfie optional) → pending card appears.
+- [ ] Student flow: submit via student card photo OR university email.
+- [ ] Duplicate submissions blocked with a friendly message while one is
+      pending.
+- [ ] Promotion of a reviewer: in the SQL Editor,
+      `insert into public.admin_users (user_id) values ('<user-uuid>');`
+      (no admin UI in this phase).
+- [ ] As admin: `select * from admin_list_verifications('pending')` returns
+      the queue with user email/name.
+- [ ] `select * from admin_review_verification('<id>', 'approve')` →
+      profile shows `verification_status = 'Verified'` and the matching
+      `is_government_id_verified` / `is_student_verified = true`.
+- [ ] `admin_review_verification('<id>', 'reject', 'reason')` → user sees
+      the reason on the verification screen and can "Submit again"
+      (resubmission).
+- [ ] `is_user_verified()` returns true once any method is approved (used
+      to gate ride creation/joining once rides ship).
+- [ ] Rejected/expired submissions can be resubmitted; an approved one
+      cannot.
+- [ ] A non-admin calling `admin_list_verifications` / `admin_review_verification`
+      gets `Admin access required` (SQLSTATE 42501).
+- [ ] Documents are invisible to everyone except the owner and admins
+      (private bucket); render via `createSignedUrl` client-side, or the
+      service-role key server-side for admins.
 
 ## Notes & security
 

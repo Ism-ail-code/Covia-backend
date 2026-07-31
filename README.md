@@ -4,11 +4,12 @@ Backend foundation for **Covia** — a mobile app that coordinates shared rides
 booked through third-party ride-hailing services (Uber, Bolt, Careem, inDrive).
 
 This repository currently contains **Phase 1: infrastructure only** plus the
-**Phase 2 Supabase support** (auth schema + setup guide) and **Phase 3 user
+**Phase 2 Supabase support** (auth schema + setup guide), **Phase 3 user
 profiles** (identity fields, username rules, public/private profile model,
-avatar storage). No product features (rides, chats, payments) are implemented
-yet; the architecture, tooling, and conventions below are in place to build
-them on.
+avatar storage) and **Phase 4 identity verification** (government ID +
+student checks, private document storage, admin review functions). No product
+features (rides, chats, payments) are implemented yet; the architecture,
+tooling, and conventions below are in place to build them on.
 
 > Authentication and profiles for the mobile app run on **Supabase** (Auth +
 > Postgres + Storage). This repo ships the schema (`supabase/migrations/`),

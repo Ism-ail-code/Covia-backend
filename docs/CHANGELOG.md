@@ -43,6 +43,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 - Note: authentication itself lives in the mobile client (Supabase Auth);
   the NestJS API remains the Phase 3+ server for business endpoints.
 
+### Phase 4 — Identity verification (mobile)
+
+- `supabase/migrations/0005_verification_schema.sql` — `verification_submissions`
+  (type, ID kind, status lifecycle incl. `expired` + `resubmission_requested`,
+  review fields, per-type evidence checks, active-row partial unique index),
+  `verification_audit`, `admin_users`, `notification_events` (placeholder
+  inbox); `is_admin()` security definer helper; RLS — no client writes,
+  users read own submissions/notifications only, admins read everything.
+- `supabase/migrations/0006_verification_storage.sql` — **private**
+  `verification-documents` Storage bucket (10 MB, jpeg/png/webp) with RLS:
+  owners insert/update/delete/read only `verification/<uid>/…`, admins may
+  read all; documents are referenced by path and rendered via signed URLs.
+- `supabase/migrations/0007_verification_user_functions.sql` —
+  `submit_verification` (validates evidence, rejects duplicates with 23505),
+  `resubmit_verification` (owner-only, for rejected/re-upload requests),
+  `get_my_verification`, `is_user_verified` (ride-creation gate).
+- `supabase/migrations/0008_verification_admin_functions.sql` —
+  `admin_list_verifications(status)` queue (joins user email/name) and
+  `admin_review_verification(id, approve|reject|request_resubmission, reason)`
+  — approve flips `verification_status` → `Verified` + the matching
+  verified flag on `profiles`; every action writes audit + notification.
+- `scripts/sql-smoke.mjs` — Phase 4 assertions added: schema/constraints,
+  submit/duplicate/evidence rules, admin gating (42501 for non-admins),
+  approve/reject/resubmit flows, profile badge updates, notifications,
+  audit RLS, storage folder policies + private bucket config. **84/84 pass.**
+- `docs/DATABASE_SCHEMA.md` — verification tables, functions, storage, RLS
+  and signed-URL guidance documented.
+
 ### Phase 3 — User profiles & identity (mobile)
 
 - `supabase/migrations/0002_profile_identity.sql` — identity fields
