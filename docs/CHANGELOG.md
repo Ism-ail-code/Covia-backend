@@ -42,3 +42,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
   `companion` scheme, SQL application, and manual test checklist.
 - Note: authentication itself lives in the mobile client (Supabase Auth);
   the NestJS API remains the Phase 3+ server for business endpoints.
+
+### Phase 3 — User profiles & identity (mobile)
+
+- `supabase/migrations/0002_profile_identity.sql` — identity fields
+  (username, date of birth, gender, country), ride-metric placeholders
+  (`total_completed_rides`, `total_cancelled_rides`), emergency contact
+  columns (all-or-nothing), username rules (unique index, format check
+  `[a-z0-9_]{3,20}`, lowercase-normalizing trigger, `reserved_usernames`
+  table + rejection trigger), value-hygiene checks (lengths, DOB future,
+  gender whitelist).
+- `supabase/migrations/0003_public_profiles.sql` — `public_profiles`
+  security-barrier view (public columns only — email/phone/DOB/gender/
+  emergency contact never exposed) + `get_public_profile(uuid)`,
+  `search_profiles(text, int)` and `is_username_available(text)` RPCs
+  (security definer, authenticated-only execute) + explicit table grants.
+- `supabase/migrations/0004_avatars_storage.sql` — public `avatars`
+  Storage bucket (5 MB, jpeg/png/webp) + RLS policies scoped to each
+  user's own folder (`avatars/<user-id>/…`), public read.
+- `scripts/sql-smoke.mjs` — applies all migrations to a scratch database
+  (stubbed `auth`/`storage` schemas) and asserts auto-creation, username
+  rules, emergency contacts, public/private split, RLS and bucket config
+  (39 checks; `pg` added as a dev dependency).
+- `docs/DATABASE_SCHEMA.md` — full schema reference (tables, view,
+  functions, storage, RLS, mobile model mapping).
+- Note: profile logic lives in the mobile client + Supabase RPCs; the
+  NestJS API remains for business endpoints (rides, chat, ratings).

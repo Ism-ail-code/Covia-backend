@@ -66,13 +66,30 @@ companion://reset
      (carrying `full_name` / `phone` from signup metadata).
    - Row Level Security: users can select/update **only their own** row.
 
-2. Verify with:
+2. Run the Phase 3 migrations in order:
+
+   - `supabase/migrations/0002_profile_identity.sql` — identity fields
+     (username, DOB, gender, country), ride-metric placeholders, emergency
+     contacts, username uniqueness/reserved-names rules.
+   - `supabase/migrations/0003_public_profiles.sql` — the
+     `public_profiles` view (public info only) and the
+     `get_public_profile` / `search_profiles` / `is_username_available`
+     functions.
+   - `supabase/migrations/0004_avatars_storage.sql` — the public `avatars`
+     Storage bucket with folder-scoped RLS policies.
+
+   Local SQL can be smoke-tested against the embedded PostgreSQL before
+   applying anywhere: `node scripts/sql-smoke.mjs` (database must be
+   running — `pnpm db:dev:start`).
+
+3. Verify with:
 
    ```sql
    select * from public.profiles;
+   select * from public.public_profiles;
    ```
 
-3. (Optional) Apply via the Supabase CLI instead:
+4. (Optional) Apply via the Supabase CLI instead:
 
    ```sh
    supabase db push
@@ -95,6 +112,25 @@ companion://reset
       exists" message.
 - [ ] **Unverified login attempt** → friendly "Please verify your email"
       message with the verify screen.
+
+### Phase 3 — profile checks
+
+- [ ] Profile row exists immediately after signup (trigger).
+- [ ] Create-profile screen saves display name, username, city, country,
+      bio → reflected in the profile tab.
+- [ ] Username: lowercase-normalized; duplicates and reserved names
+      (`admin`, `support`, …) rejected with friendly messages; 3–20 chars,
+      `[a-z0-9_]` enforced.
+- [ ] Avatar upload (create-profile): photo appears in the profile tab;
+      invalid types/sizes rejected; re-upload replaces the old file.
+- [ ] Emergency contact (Safety centre): add → edit → remove works; partial
+      contacts rejected.
+- [ ] Profile tab shows `@username` and `city, country`.
+- [ ] `get_public_profile(<other-user-id>)` returns only public fields
+      (no email/phone/DOB/emergency contact).
+- [ ] `search_profiles('ali')` finds `alice_example`.
+- [ ] Direct table access as another user returns only your own row
+      (RLS) — verified by `scripts/sql-smoke.mjs`.
 
 ## Notes & security
 

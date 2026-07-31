@@ -4,14 +4,18 @@ Backend foundation for **Covia** — a mobile app that coordinates shared rides
 booked through third-party ride-hailing services (Uber, Bolt, Careem, inDrive).
 
 This repository currently contains **Phase 1: infrastructure only** plus the
-**Phase 2 Supabase support** (database migration + setup guide). No product
-features (rides, chats, payments) are implemented yet; the architecture,
-tooling, and conventions below are in place to build them on.
+**Phase 2 Supabase support** (auth schema + setup guide) and **Phase 3 user
+profiles** (identity fields, username rules, public/private profile model,
+avatar storage). No product features (rides, chats, payments) are implemented
+yet; the architecture, tooling, and conventions below are in place to build
+them on.
 
-> Authentication for the mobile app runs on **Supabase Auth** (client-side).
-> This repo ships the Supabase schema (`supabase/migrations/0001_profiles.sql`)
-> and the setup guide (`docs/SUPABASE_SETUP.md`). The NestJS API will serve
-> business endpoints in later phases.
+> Authentication and profiles for the mobile app run on **Supabase** (Auth +
+> Postgres + Storage). This repo ships the schema (`supabase/migrations/`),
+> a local SQL smoke test (`scripts/sql-smoke.mjs`) and the setup guide
+> (`docs/SUPABASE_SETUP.md`). See `docs/DATABASE_SCHEMA.md` for the full
+> schema reference. The NestJS API will serve business endpoints in later
+> phases.
 
 ## Stack
 
@@ -96,6 +100,14 @@ PostgreSQL — the connection string is taken from `DATABASE_URL`.
 
 Migrations are managed with `prisma migrate`; the first migration will be
 created when the first application models are added.
+
+The same embedded database doubles as a test bed for the Supabase SQL
+migrations:
+
+```bash
+pnpm db:dev:start          # boot the database (terminal)
+node scripts/sql-smoke.mjs # apply supabase/migrations/* to a scratch DB + assert
+```
 
 ## Repository layout
 
