@@ -5,9 +5,11 @@
  * `dev-db.mjs`) and applies every `supabase/migrations/*.sql` file,
  * stubbing the Supabase-managed schemas (`auth`, `storage`) that don't
  * exist in a vanilla Postgres. Then asserts the Phase 3 behaviours
- * (profiles, usernames, privacy, RLS) and the Phase 4 verification
+ * (profiles, usernames, privacy, RLS), the Phase 4 verification
  * behaviours (submissions, admin review, profile badges, notifications,
- * private document storage).
+ * private document storage) and the Phase 5 ride behaviours (creation,
+ * publishing, requests + approvals, capacity, lifecycle transitions,
+ * search/discovery, timeline, RLS).
  *
  * Usage (with the embedded database running):
  *   node scripts/sql-smoke.mjs
@@ -380,6 +382,590 @@ async function main() {
 
   await vClient.query('reset role');
   await vClient.end();
+
+  // ── Phase 5: rides ─────────────────────────────────────────────────
+  const rideClient = new Client({ connectionString: `${DSN}/${TEST_DB}` });
+  await rideClient.connect();
+  await rideClient.query(`set role authenticated`);
+  const asUser = (id) =>
+    rideClient.query(`select set_config('request.jwt.claim.sub', $1, false)`, [id]);
+  const t0 = new Date();
+  const dep = (h) => new Date(t0.getTime() + h * 3600 * 1000).toISOString();
+  const createRide = async (origin, dest, pickup, h, seats, fare = 'fixed', fixedFare = null, student = false, women = false) => {
+    const r = await rideClient.query(
+      `select * from public.create_ride($1, $2, $3, $4, $5, $6, $7, null, null, $8, $9, null)`,
+      [origin, dest, pickup, dep(h), seats, fare, fixedFare, student, women],
+    );
+    return r.rows[0];
+  };
+  const publishRide = async (id) => {
+    const r = await rideClient.query(`select * from public.publish_ride($1)`, [id]);
+    return r.rows[0];
+  };
+  const timelineEvents = async (rideId) => {
+    const r = await rideClient.query(
+      `select event_type from public.ride_timeline where ride_id = $1 order by created_at`,
+      [rideId],
+    );
+    return r.rows.map((row) => row.event_type);
+  };
+
+  // Schema: rides / requests / participants / timeline columns.
+  const rideCols = await rideClient.query(
+    `select column_name from information_schema.columns
+     where table_schema = 'public' and table_name = 'rides'`,
+  );
+  const rideNames = rideCols.rows.map((c) => c.column_name);
+  for (const col of ['id', 'host_id', 'origin', 'destination', 'pickup_point', 'destination_point', 'origin_lat', 'origin_lng', 'destination_lat', 'destination_lng', 'departure_time', 'estimated_arrival', 'total_seats', 'available_seats', 'fare_mode', 'fixed_fare', 'ride_status', 'is_student_only', 'is_women_only', 'notes', 'created_at', 'updated_at']) {
+    assert(rideNames.includes(col), `rides has ${col}`);
+  }
+  const reqCols = await rideClient.query(
+    `select column_name from information_schema.columns
+     where table_schema = 'public' and table_name = 'ride_requests'`,
+  );
+  const reqNames = reqCols.rows.map((c) => c.column_name);
+  for (const col of ['id', 'ride_id', 'passenger_id', 'status', 'requested_at', 'responded_at']) {
+    assert(reqNames.includes(col), `ride_requests has ${col}`);
+  }
+  const partCols = await rideClient.query(
+    `select column_name from information_schema.columns
+     where table_schema = 'public' and table_name = 'ride_participants'`,
+  );
+  const partNames = partCols.rows.map((c) => c.column_name);
+  for (const col of ['ride_id', 'user_id', 'role', 'joined_at', 'left_at']) {
+    assert(partNames.includes(col), `ride_participants has ${col}`);
+  }
+  const tlCols = await rideClient.query(
+    `select column_name from information_schema.columns
+     where table_schema = 'public' and table_name = 'ride_timeline'`,
+  );
+  const tlNames = tlCols.rows.map((c) => c.column_name);
+  for (const col of ['id', 'ride_id', 'event_type', 'actor_id', 'metadata', 'created_at']) {
+    assert(tlNames.includes(col), `ride_timeline has ${col}`);
+  }
+  const tlDef = await rideClient.query(
+    `select pg_get_constraintdef(oid) as def from pg_constraint
+     where conrelid = 'public.ride_timeline'::regclass and contype = 'c'`,
+  );
+  const tlEvents = ['created', 'published', 'requested', 'request_cancelled', 'approved', 'rejected', 'joined', 'left', 'ride_full', 'edited', 'started', 'completed', 'cancelled'];
+  assert(tlEvents.every((e) => tlDef.rows.some((r) => r.def.includes(`'${e}'`))), 'ride_timeline event_type check covers all 13 events');
+
+  const grants = await rideClient.query(
+    `select
+       has_function_privilege('authenticated', 'public.create_ride(text,text,text,timestamptz,integer,text,numeric,text,text,boolean,boolean,timestamptz)', 'execute') as auth_create,
+       has_function_privilege('anon', 'public.create_ride(text,text,text,timestamptz,integer,text,numeric,text,text,boolean,boolean,timestamptz)', 'execute') as anon_create,
+       has_function_privilege('public', 'public.record_ride_event(uuid,text,uuid,jsonb)', 'execute') as pub_evt,
+       has_function_privilege('authenticated', 'public.search_rides(text,text,date,time,integer,boolean,boolean,text,numeric,numeric,integer,integer)', 'execute') as auth_search`,
+  );
+  assert(grants.rows[0].auth_create === true, 'authenticated can execute create_ride');
+  assert(grants.rows[0].anon_create === false, 'anon cannot execute create_ride');
+  assert(grants.rows[0].pub_evt === false, 'record_ride_event revoked from public');
+  assert(grants.rows[0].auth_search === true, 'authenticated can execute search_rides');
+
+  // Make carol a verified user (bob is the admin who approves her).
+  const user3 = crypto.randomUUID();
+  await rideClient.query('reset role');
+  await rideClient.query(
+    `insert into auth.users (id, email, raw_user_meta_data) values
+       ($1, 'carol@example.com', '{"full_name":"Carol Example"}')`,
+    [user3],
+  );
+  await rideClient.query(`set role authenticated`);
+  await asUser(user3);
+  const cSub = await rideClient.query(
+    `select * from public.submit_verification('government_id', $1, $2, null, null, null, 'national_id')`,
+    [`verification/${user3}/front.png`, `verification/${user3}/back.png`],
+  );
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_review_verification($1, 'approve')`, [cSub.rows[0].id]);
+  await asUser(user3);
+  const cVer = await rideClient.query(`select public.is_user_verified() as v`);
+  assert(cVer.rows[0].v === true, 'carol verified after admin approval');
+
+  // Unverified users cannot create rides or request seats.
+  await asUser(user2);
+  const unverCreate = await rideClient.query(
+    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 3, 'fixed', 1500)`,
+    [dep(10)],
+  ).then(() => null).catch((e) => e);
+  assert(unverCreate && typeof unverCreate.message === 'string' && unverCreate.message.includes('verified'), 'unverified user cannot create a ride');
+
+  // Create validation (verified host).
+  await asUser(user1);
+  const vPast = await rideClient.query(
+    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 3, 'fixed', 1500)`,
+    [new Date(t0.getTime() - 3600 * 1000).toISOString()],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof vPast === 'string' && vPast.includes('future'), 'past departure rejected');
+  const vOrigin = await rideClient.query(
+    `select * from public.create_ride('', 'VI', 'Jibowu', $1, 3, 'fixed', 1500)`,
+    [dep(10)],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof vOrigin === 'string' && vOrigin.includes('Origin'), 'empty origin rejected');
+  const vSeats = await rideClient.query(
+    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 0, 'fixed', 1500)`,
+    [dep(10)],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof vSeats === 'string' && vSeats.includes('between 1 and 10'), 'zero seats rejected');
+  const vSeatsBig = await rideClient.query(
+    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 11, 'fixed', 1500)`,
+    [dep(10)],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof vSeatsBig === 'string' && vSeatsBig.includes('between 1 and 10'), 'eleven seats rejected');
+  const vNoFare = await rideClient.query(
+    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 3, 'fixed', null)`,
+    [dep(10)],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof vNoFare === 'string' && vNoFare.includes('per-seat fare'), 'fixed fare missing rejected');
+  const vSmartFare = await rideClient.query(
+    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 3, 'smart', 1500)`,
+    [dep(10)],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof vSmartFare === 'string' && vSmartFare.includes('Smart fares'), 'smart fare with amount rejected');
+  const vStudent = await rideClient.query(
+    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 3, 'fixed', 1500, null, null, $2, $3, null)`,
+    [dep(10), true, false],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof vStudent === 'string' && vStudent.includes('verified students'), 'student-only ride requires verified student');
+
+  // Ride A: create + publish.
+  const aRow = await createRide('Ikeja', 'Victoria Island', 'Jibowu Bus Stop', 10, 3, 'fixed', 1500);
+  const aId = aRow.id;
+  assert(aRow.ride_status === 'draft' && Number(aRow.available_seats) === 3 && Number(aRow.fixed_fare) === 1500, 'create_ride returns a draft with full seats');
+  assert(JSON.stringify(await timelineEvents(aId)) === JSON.stringify(['created']), 'timeline starts with created');
+  const pubA = await publishRide(aId);
+  assert(pubA.ride_status === 'published', 'publish_ride flips draft to published');
+  const aParts = await rideClient.query(
+    `select * from public.get_ride_participants($1)`,
+    [aId],
+  );
+  assert(aParts.rowCount === 1 && aParts.rows[0].role === 'Host' && aParts.rows[0].user_id === user1, 'host joins as participant on publish');
+  assert(JSON.stringify(await timelineEvents(aId)) === JSON.stringify(['created', 'published']), 'publish event recorded');
+  const repub = await rideClient.query(`select * from public.publish_ride($1)`, [aId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof repub === 'string' && repub.includes('Only draft rides'), 'republishing a published ride rejected');
+  await asUser(user2);
+  const notHostPub = await rideClient.query(`select * from public.publish_ride($1)`, [aId])
+    .then(() => null).catch((e) => e.code);
+  assert(notHostPub === '42501', 'non-host cannot publish');
+
+  // Request workflow on A.
+  await asUser(user2);
+  const unverReq = await rideClient.query(`select * from public.request_to_join($1)`, [aId])
+    .then(() => null).catch((e) => e);
+  assert(unverReq && typeof unverReq.message === 'string' && unverReq.message.includes('verified'), 'unverified user cannot request to join');
+  await asUser(user3);
+  const reqA = await rideClient.query(`select * from public.request_to_join($1)`, [aId]);
+  assert(reqA.rows[0].status === 'pending', 'carol request to join creates a pending request');
+  const dupReq = await rideClient.query(`select * from public.request_to_join($1)`, [aId])
+    .then(() => null).catch((e) => e.code);
+  assert(dupReq === '23505', 'duplicate pending request rejected');
+  await asUser(user2);
+  const nonHostRespond = await rideClient.query(
+    `select * from public.host_respond_to_request($1, true, null)`,
+    [reqA.rows[0].id],
+  ).then(() => null).catch((e) => e.code);
+  assert(nonHostRespond === '42501', 'non-host cannot respond to a request');
+  await asUser(user1);
+  const okA = await rideClient.query(
+    `select * from public.host_respond_to_request($1, true, null)`,
+    [reqA.rows[0].id],
+  );
+  assert(okA.rows[0].status === 'approved', 'host approval flips request to approved');
+  const aAvail = await rideClient.query(`select available_seats from public.rides where id = $1`, [aId]);
+  assert(Number(aAvail.rows[0].available_seats) === 2, 'approval decrements available seats');
+  const aEvents = await timelineEvents(aId);
+  assert(aEvents.includes('approved') && aEvents.includes('joined'), 'approval records approved + joined events');
+  await asUser(user3);
+  const alreadyOn = await rideClient.query(`select * from public.request_to_join($1)`, [aId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof alreadyOn === 'string' && alreadyOn.includes('already on this ride'), 'approved passenger cannot re-request the same ride');
+
+  // Ride B: overlap blocks carol (she holds a seat on A).
+  await asUser(user1);
+  const bRow = await createRide('Ikeja', 'VI', 'Jibowu', 12, 3, 'fixed', 1800);
+  const bId = bRow.id;
+  await publishRide(bId);
+  await asUser(user3);
+  const overlapPart = await rideClient.query(`select * from public.request_to_join($1)`, [bId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof overlapPart === 'string' && overlapPart.includes('already have a seat'), 'overlapping ride blocked for an existing passenger');
+
+  // Bob becomes verified; pending-request overlap is blocked via C.
+  await rideClient.query('reset role');
+  await rideClient.query(
+    `insert into public.verification_submissions (user_id, verification_type, status, government_id_kind, front_document_url)
+     values ($1, 'government_id', 'approved', 'national_id', $2)`,
+    [user2, `verification/${user2}/front.png`],
+  );
+  await rideClient.query(
+    `update public.profiles set is_government_id_verified = true, verification_status = 'Verified' where id = $1`,
+    [user2],
+  );
+  await rideClient.query(
+    `update public.profiles set is_student_verified = true, verification_status = 'Verified' where id = $1`,
+    [user1],
+  );
+  await rideClient.query(
+    `update public.profiles set username = 'carol_03' where id = $1`,
+    [user3],
+  );
+  await rideClient.query(`set role authenticated`);
+  await asUser(user2);
+  const reqB1 = await rideClient.query(`select * from public.request_to_join($1)`, [bId]);
+  assert(reqB1.rows[0].status === 'pending', 'verified bob can request a seat on B');
+  await asUser(user1);
+  const cRow = await createRide('Ikeja', 'Lekki', 'Marina', 16, 3, 'fixed', 2200);
+  const cId = cRow.id;
+  await publishRide(cId);
+  await asUser(user2);
+  const overlapReq = await rideClient.query(`select * from public.request_to_join($1)`, [cId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof overlapReq === 'string' && overlapReq.includes('already have a request'), 'pending request blocks an overlapping ride');
+
+  // Withdraw + reject workflow.
+  const bReq1Id = reqB1.rows[0].id;
+  await asUser(user3);
+  const otherCancel = await rideClient.query(`select * from public.cancel_ride_request($1)`, [bReq1Id])
+    .then(() => null).catch((e) => e.code);
+  assert(otherCancel === '42501', 'another user cannot withdraw a request');
+  await asUser(user2);
+  const cancel1 = await rideClient.query(`select * from public.cancel_ride_request($1)`, [bReq1Id]);
+  assert(cancel1.rows[0].status === 'cancelled' && cancel1.rows[0].responded_at !== null, 'passenger can withdraw a pending request');
+  const cancelAgain = await rideClient.query(`select * from public.cancel_ride_request($1)`, [bReq1Id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof cancelAgain === 'string' && cancelAgain.includes('Only pending requests'), 'withdrawing twice rejected');
+  const reqB2 = await rideClient.query(`select * from public.request_to_join($1)`, [bId]);
+  await asUser(user1);
+  const rejB = await rideClient.query(
+    `select * from public.host_respond_to_request($1, false, 'Not the right fit')`,
+    [reqB2.rows[0].id],
+  );
+  assert(rejB.rows[0].status === 'rejected' && rejB.rows[0].responded_at !== null, 'host rejection recorded with response time');
+  const bEvents = await timelineEvents(bId);
+  for (const ev of ['created', 'published', 'requested', 'request_cancelled', 'rejected']) {
+    assert(bEvents.includes(ev), `ride B timeline includes ${ev}`);
+  }
+
+  // Editing rules.
+  const editedSeats = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, $2, null, null)`,
+    [bId, 4],
+  );
+  assert(Number(editedSeats.rows[0].total_seats) === 4 && Number(editedSeats.rows[0].available_seats) === 4, 'seat increase recalculates available seats');
+  const pastEdit = await rideClient.query(
+    `select * from public.update_ride($1, $2, null, null, null, null, null)`,
+    [bId, new Date(t0.getTime() - 3600 * 1000).toISOString()],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof pastEdit === 'string' && pastEdit.includes('future'), 'editing departure to the past rejected');
+  const badSeats = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, $2, null, null)`,
+    [bId, 0],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badSeats === 'string' && badSeats.includes('between 1 and 10'), 'editing seats out of range rejected');
+  const smartEdit = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, null, $2, null)`,
+    [bId, 'smart'],
+  );
+  assert(smartEdit.rows[0].fare_mode === 'smart' && smartEdit.rows[0].fixed_fare === null, 'switching to smart fare clears the fixed amount');
+  const fixedEdit = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, null, $2, $3)`,
+    [bId, 'fixed', 2000],
+  );
+  assert(fixedEdit.rows[0].fare_mode === 'fixed' && Number(fixedEdit.rows[0].fixed_fare) === 2000, 'switching back to fixed fare sets the amount');
+  await asUser(user2);
+  const notHostEdit = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, $2, null, null)`,
+    [bId, 5],
+  ).then(() => null).catch((e) => e.code);
+  assert(notHostEdit === '42501', 'non-host cannot edit a ride');
+
+  // Ride D: capacity, full status, leave.
+  await asUser(user1);
+  const dRow = await createRide('Ikeja', 'VI', 'Jibowu', 20, 1, 'fixed', 1000);
+  const dId = dRow.id;
+  await publishRide(dId);
+  await asUser(user3);
+  const reqD = await rideClient.query(`select * from public.request_to_join($1)`, [dId]);
+  await asUser(user1);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [reqD.rows[0].id]);
+  const fullD = await rideClient.query(`select ride_status, available_seats from public.rides where id = $1`, [dId]);
+  assert(fullD.rows[0].ride_status === 'full' && Number(fullD.rows[0].available_seats) === 0, 'last seat approval auto-flips ride to full');
+  const dEvents = await timelineEvents(dId);
+  assert(dEvents.includes('ride_full'), 'ride_full event recorded');
+  await asUser(user2);
+  const fullReq = await rideClient.query(`select * from public.request_to_join($1)`, [dId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof fullReq === 'string' && fullReq.includes('full'), 'requesting a full ride rejected');
+  await asUser(user3);
+  const leaveD = await rideClient.query(`select * from public.leave_ride($1)`, [dId]);
+  assert(leaveD.rows[0].ride_status === 'published' && Number(leaveD.rows[0].available_seats) === 1, 'leaving frees a seat and re-opens the ride');
+  const dLeft = await rideClient.query(
+    `select left_at from public.ride_participants where ride_id = $1 and user_id = $2`,
+    [dId, user3],
+  );
+  assert(dLeft.rows[0].left_at !== null, 'departure marked on the participant row');
+  assert((await timelineEvents(dId)).includes('left'), 'left event recorded');
+  await asUser(user2);
+  const reqD2 = await rideClient.query(`select * from public.request_to_join($1)`, [dId]);
+  await asUser(user1);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [reqD2.rows[0].id]);
+  const fullAgain = await rideClient.query(`select ride_status from public.rides where id = $1`, [dId]);
+  assert(fullAgain.rows[0].ride_status === 'full', 'bob approval re-fills ride D');
+
+  // Lifecycle: start → complete (host only), cancel rules.
+  await asUser(user2);
+  const bobStart = await rideClient.query(`select * from public.start_ride($1)`, [dId])
+    .then(() => null).catch((e) => e.code);
+  assert(bobStart === '42501', 'non-host cannot start a ride');
+  await asUser(user1);
+  const started = await rideClient.query(`select * from public.start_ride($1)`, [dId]);
+  assert(started.rows[0].ride_status === 'in_progress', 'start_ride moves to in_progress');
+  assert((await timelineEvents(dId)).includes('started'), 'started event recorded');
+  const startAgain = await rideClient.query(`select * from public.start_ride($1)`, [dId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof startAgain === 'string' && startAgain.includes('Only published rides'), 'starting twice rejected');
+  const completed = await rideClient.query(`select * from public.complete_ride($1)`, [dId]);
+  assert(completed.rows[0].ride_status === 'completed', 'complete_ride finishes the ride');
+  assert((await timelineEvents(dId)).includes('completed'), 'completed event recorded');
+  const cancelStarted = await rideClient.query(`select * from public.cancel_ride($1)`, [dId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof cancelStarted === 'string' && cancelStarted.includes('cannot be cancelled'), 'cancelling a started ride rejected');
+  await rideClient.query('reset role');
+  const counters = await rideClient.query(
+    `select id, total_completed_rides, total_cancelled_rides from public.profiles
+     where id in ($1, $2, $3) order by id`,
+    [user1, user2, user3],
+  );
+  await rideClient.query(`set role authenticated`);
+  await asUser(user1);
+  const counterRow = (id) => counters.rows.find((r) => r.id === id);
+  assert(Number(counterRow(user1).total_completed_rides) === 1, 'host completed counter incremented');
+  assert(Number(counterRow(user2).total_completed_rides) === 1, 'riding passenger completed counter incremented');
+  assert(Number(counterRow(user3).total_completed_rides) === 0, 'passenger who left is not counted as completed');
+
+  // Cancel A (host), then the guards around a cancelled ride.
+  const cancelledA = await rideClient.query(`select * from public.cancel_ride($1)`, [aId]);
+  assert(cancelledA.rows[0].ride_status === 'cancelled', 'cancel_ride ends a published ride');
+  assert((await timelineEvents(aId)).includes('cancelled'), 'cancelled event recorded');
+  const cancelTwice = await rideClient.query(`select * from public.cancel_ride($1)`, [aId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof cancelTwice === 'string' && cancelTwice.includes('already cancelled'), 'cancelling twice rejected');
+  const startCancelled = await rideClient.query(`select * from public.start_ride($1)`, [aId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof startCancelled === 'string' && startCancelled.includes('Only published rides'), 'cancelled ride cannot be started');
+  const editCancelled = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, $2, null, null)`,
+    [aId, 5],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof editCancelled === 'string' && editCancelled.includes('can no longer be edited'), 'cancelled ride cannot be edited');
+
+  // Ride E: seat floor — cannot drop below the approved headcount.
+  const eRow = await createRide('Ikeja', 'VI', 'Jibowu', 23, 3, 'fixed', 1500);
+  const eId = eRow.id;
+  await publishRide(eId);
+  await asUser(user3);
+  const reqE1 = await rideClient.query(`select * from public.request_to_join($1)`, [eId]);
+  await asUser(user2);
+  const reqE2 = await rideClient.query(`select * from public.request_to_join($1)`, [eId]);
+  await asUser(user1);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [reqE1.rows[0].id]);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [reqE2.rows[0].id]);
+  const floorOk = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, $2, null, null)`,
+    [eId, 2],
+  );
+  assert(floorOk.rows[0].ride_status === 'full' && Number(floorOk.rows[0].available_seats) === 0, 'reducing seats to the approved headcount is allowed (ride full)');
+  const floorEdit = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, $2, null, null)`,
+    [eId, 1],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof floorEdit === 'string' && floorEdit.includes('approved passengers'), 'seats cannot drop below approved passengers');
+  await asUser(user3);
+  await rideClient.query(`select * from public.leave_ride($1)`, [eId]);
+  await asUser(user2);
+  await rideClient.query(`select * from public.leave_ride($1)`, [eId]);
+  await asUser(user1);
+  const shrinkE = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, $2, null, null)`,
+    [eId, 1],
+  );
+  assert(Number(shrinkE.rows[0].total_seats) === 1 && Number(shrinkE.rows[0].available_seats) === 1, 'seat reduction allowed after passengers left');
+
+  // Ride F: full ride re-opened by seat increase.
+  const fRow = await createRide('Ikeja', 'VI', 'Jibowu', 24, 1, 'fixed', 1200);
+  const fId = fRow.id;
+  await publishRide(fId);
+  await asUser(user3);
+  const reqF = await rideClient.query(`select * from public.request_to_join($1)`, [fId]);
+  await asUser(user1);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [reqF.rows[0].id]);
+  const growF = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, $2, null, null)`,
+    [fId, 2],
+  );
+  assert(growF.rows[0].ride_status === 'published' && Number(growF.rows[0].available_seats) === 1, 'adding a seat re-opens a full ride');
+
+  // Student-only + women-only rides (alice is now a verified student).
+  const gRow = await createRide('Ikeja', 'VI', 'Marina', 26, 2, 'fixed', 800, true, false);
+  const gId = gRow.id;
+  await publishRide(gId);
+  assert(gRow.is_student_only === true, 'student-only ride created by verified student');
+  const hRow = await createRide('Ikeja', 'VI', 'Marina', 27, 2, 'fixed', 900, false, true);
+  const hId = hRow.id;
+  await publishRide(hId);
+  assert(hRow.is_women_only === true, 'women-only ride created');
+
+  // Ride I: cancelling closes pending requests.
+  const iRow = await createRide('Ikeja', 'VI', 'Marina', 30, 2, 'fixed', 1300);
+  const iId = iRow.id;
+  await publishRide(iId);
+  await asUser(user3);
+  const reqI = await rideClient.query(`select * from public.request_to_join($1)`, [iId]);
+  assert(reqI.rows[0].status === 'pending', 'carol can request a ride 6h after her other ride');
+  await asUser(user1);
+  await rideClient.query(`select * from public.cancel_ride($1)`, [iId]);
+  const closedReq = await rideClient.query(`select status, responded_at from public.ride_requests where id = $1`, [reqI.rows[0].id]);
+  assert(closedReq.rows[0].status === 'cancelled' && closedReq.rows[0].responded_at !== null, 'cancelling the ride closes pending requests');
+  const iEvents = await timelineEvents(iId);
+  assert(iEvents.includes('requested') && iEvents.includes('cancelled'), 'ride I timeline shows request then cancel');
+
+  // Draft ride J (never published).
+  const jRow = await createRide('Ikeja', 'Badagry', 'Mile 2', 28, 3, 'fixed', 2000);
+  const jId = jRow.id;
+
+  // Search & discovery.
+  const searchRides = async (origin = null, dest = null, date = null, timeFrom = null, seats = null, student = null, women = null, sort = null, page = 1, pageSize = 20) => {
+    const r = await rideClient.query(
+      `select * from public.search_rides($1, $2, $3, $4, $5, $6, $7, $8, null, null, $9, $10)`,
+      [origin, dest, date, timeFrom, seats, student, women, sort, page, pageSize],
+    );
+    return r.rows;
+  };
+  await asUser(user3);
+  const allSearch = await searchRides();
+  assert(allSearch.length === 6 && Number(allSearch[0].total_count) === 6, 'search returns only published/full rides (6)');
+  const ikejaSearch = await searchRides('ikeja');
+  assert(ikejaSearch.length === 6, 'origin filter matches case-insensitively');
+  const missSearch = await searchRides('Lagos');
+  assert(missSearch.length === 0, 'no matches for unknown origin');
+  const destSearch = await searchRides(null, 'lekki');
+  assert(destSearch.length === 1 && destSearch[0].id === cId, 'destination filter narrows results');
+  const destSearch2 = await searchRides(null, 'VI');
+  assert(destSearch2.length === 5, 'destination filter with multiple matches');
+  const seatSearch = await searchRides(null, null, null, null, 2);
+  assert(seatSearch.length === 4, 'available seats filter applies');
+  const stuSearch = await searchRides(null, null, null, null, null, true);
+  assert(stuSearch.length === 1 && stuSearch[0].id === gId, 'student-only filter');
+  const womSearch = await searchRides(null, null, null, null, null, null, true);
+  assert(womSearch.length === 1 && womSearch[0].id === hId, 'women-only filter');
+  const nonStuSearch = await searchRides(null, null, null, null, null, false);
+  assert(nonStuSearch.length === 5, 'non-student rides returned when filter is false');
+  const recentSearch = await searchRides(null, null, null, null, null, null, null, 'recent');
+  assert(recentSearch[0].id === hId, 'sort by recent returns newest first');
+  const depSearch = await searchRides(null, null, null, null, null, null, null, 'departure');
+  assert(depSearch[0].id === bId, 'sort by departure returns soonest first');
+  const distSearch = await searchRides(null, null, null, null, null, null, null, 'distance');
+  assert(distSearch.length === 6, 'distance sort without coordinates falls back to departure');
+  const page1 = await searchRides(null, null, null, null, null, null, null, null, 1, 2);
+  const page2 = await searchRides(null, null, null, null, null, null, null, null, 2, 2);
+  const page3 = await searchRides(null, null, null, null, null, null, null, null, 3, 2);
+  const page4 = await searchRides(null, null, null, null, null, null, null, null, 4, 2);
+  assert(page1.length === 2 && page2.length === 2 && page3.length === 2 && page4.length === 0, 'pagination pages over results');
+  assert(Number(page1[0].total_count) === 6, 'total_count stable across pages');
+  const gDate = dep(26).slice(0, 10);
+  const dateSearch = await searchRides(null, null, gDate);
+  assert(dateSearch.every((r) => r.departure_time.toISOString().slice(0, 10) === gDate), 'date filter only returns that day');
+  const timeSearch = await searchRides(null, null, null, '00:00:00');
+  assert(timeSearch.length === 6, 'time-from filter at midnight matches everything');
+  assert(allSearch.every((r) => r.host_username === 'alice_example'), 'search joins host public profile');
+
+  // Ride detail.
+  const detailA = await rideClient.query(`select * from public.get_ride($1)`, [aId]);
+  assert(detailA.rowCount === 1 && detailA.rows[0].ride_status === 'cancelled' && detailA.rows[0].host_username === 'alice_example', 'cancelled ride still visible to anyone');
+  const draftHidden = await rideClient.query(`select * from public.get_ride($1)`, [jId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof draftHidden === 'string' && draftHidden.includes('Ride not found'), 'draft ride hidden from non-hosts');
+  const missingRide = await rideClient.query(`select * from public.get_ride($1)`, [crypto.randomUUID()])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof missingRide === 'string' && missingRide.includes('Ride not found'), 'unknown ride id rejected');
+  await asUser(user1);
+  const draftOwn = await rideClient.query(`select * from public.get_ride($1)`, [jId]);
+  assert(draftOwn.rowCount === 1 && draftOwn.rows[0].ride_status === 'draft', 'host sees their own draft');
+
+  // Participants / requests / timeline RPCs.
+  await asUser(user3);
+  const fParts = await rideClient.query(`select * from public.get_ride_participants($1)`, [fId]);
+  assert(fParts.rowCount === 2 && fParts.rows[0].role === 'Host' && fParts.rows[0].username === 'alice_example' && fParts.rows[1].username === 'carol_03', 'participants list with host first');
+  await asUser(user2);
+  const nonMemberParts = await rideClient.query(`select * from public.get_ride_participants($1)`, [fId])
+    .then(() => null).catch((e) => e.code);
+  assert(nonMemberParts === '42501', 'non-member cannot list participants');
+  await asUser(user1);
+  const bRequests = await rideClient.query(`select * from public.get_ride_requests($1)`, [bId]);
+  assert(bRequests.rowCount === 2, 'host sees both requests on B');
+  assert(bRequests.rows.every((r) => r.passenger_username === 'bob_02'), 'request queue joins passenger profile');
+  assert(bRequests.rows.some((r) => r.status === 'cancelled') && bRequests.rows.some((r) => r.status === 'rejected'), 'request queue shows all statuses');
+  await asUser(user2);
+  const nonHostQueue = await rideClient.query(`select * from public.get_ride_requests($1)`, [bId])
+    .then(() => null).catch((e) => e.code);
+  assert(nonHostQueue === '42501', 'non-host cannot read the request queue');
+  await asUser(user1);
+  const aTimeline = await timelineEvents(aId);
+  for (const ev of ['created', 'published', 'requested', 'approved', 'joined', 'cancelled']) {
+    assert(aTimeline.includes(ev), `ride A timeline includes ${ev}`);
+  }
+  await asUser(user3);
+  const fEvents = await timelineEvents(fId);
+  const fExpected = ['created', 'published', 'requested', 'approved', 'joined', 'ride_full', 'edited'];
+  assert(JSON.stringify([...fEvents].sort()) === JSON.stringify([...fExpected].sort()), 'ride F timeline contains every event');
+  const fTl = await rideClient.query(`select event_type, created_at from public.get_ride_timeline($1)`, [fId]);
+  const fTimes = fTl.rows.map((r) => r.created_at.getTime());
+  assert(fTimes.every((t, i) => i === 0 || t >= fTimes[i - 1]), 'timeline events are time-ordered');
+  await asUser(user2);
+  const nonMemberTl = await rideClient.query(`select * from public.get_ride_timeline($1)`, [fId])
+    .then(() => null).catch((e) => e.code);
+  assert(nonMemberTl === '42501', 'non-member cannot read the timeline');
+
+  // RLS on direct reads/writes.
+  await asUser(user3);
+  const draftCount = await rideClient.query(`select count(*)::int as n from public.rides where ride_status = 'draft'`);
+  assert(draftCount.rows[0].n === 0, 'draft rides invisible to non-hosts');
+  const nonDraftCount = await rideClient.query(`select count(*)::int as n from public.rides where ride_status <> 'draft'`);
+  assert(nonDraftCount.rows[0].n === 9, 'all non-draft rides visible to authenticated users');
+  const directUpdate = await rideClient.query(`update public.rides set ride_status = 'completed' where id = $1`, [fId])
+    .then(() => null).catch((e) => e.code);
+  assert(directUpdate === '42501', 'client cannot update rides directly');
+  const directInsert = await rideClient.query(
+    `insert into public.rides (host_id, origin, destination, pickup_point, departure_time, total_seats, available_seats, fare_mode, fixed_fare)
+     values ($1, 'X', 'Y', 'Z', now() + interval '1 day', 2, 2, 'fixed', 500)`,
+    [user1],
+  ).then(() => null).catch((e) => e.code);
+  assert(directInsert === '42501', 'RLS blocks direct ride inserts');
+  const directReq = await rideClient.query(
+    `insert into public.ride_requests (ride_id, passenger_id) values ($1, $2)`,
+    [fId, user3],
+  ).then(() => null).catch((e) => e.code);
+  assert(directReq === '42501', 'RLS blocks direct request inserts');
+  const carolRequests = await rideClient.query(
+    `select count(*)::int as n from public.ride_requests where passenger_id = $1`,
+    [user3],
+  );
+  assert(carolRequests.rows[0].n === 5, 'passenger sees their own requests only');
+
+  // Final counters.
+  await rideClient.query('reset role');
+  const finalCounters = await rideClient.query(
+    `select id, total_completed_rides, total_cancelled_rides from public.profiles where id in ($1, $2) order by id`,
+    [user1, user2],
+  );
+  await rideClient.query(`set role authenticated`);
+  const finalRow = (id) => finalCounters.rows.find((r) => r.id === id);
+  assert(Number(finalRow(user1).total_completed_rides) === 1 && Number(finalRow(user1).total_cancelled_rides) === 2, 'host final counters: 1 completed, 2 cancelled');
+  assert(Number(finalRow(user2).total_completed_rides) === 1 && Number(finalRow(user2).total_cancelled_rides) === 0, 'passenger final counters: 1 completed, 0 cancelled');
+
+  await rideClient.query('reset role');
+  await rideClient.end();
 
   console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) FAILED.`);
   process.exit(failures === 0 ? 0 : 1);
