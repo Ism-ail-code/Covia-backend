@@ -3,9 +3,15 @@
 Backend foundation for **Covia** — a mobile app that coordinates shared rides
 booked through third-party ride-hailing services (Uber, Bolt, Careem, inDrive).
 
-This repository currently contains **Phase 1: infrastructure only**. No product
-features (auth, rides, chats, payments) are implemented yet; the architecture,
+This repository currently contains **Phase 1: infrastructure only** plus the
+**Phase 2 Supabase support** (database migration + setup guide). No product
+features (rides, chats, payments) are implemented yet; the architecture,
 tooling, and conventions below are in place to build them on.
+
+> Authentication for the mobile app runs on **Supabase Auth** (client-side).
+> This repo ships the Supabase schema (`supabase/migrations/0001_profiles.sql`)
+> and the setup guide (`docs/SUPABASE_SETUP.md`). The NestJS API will serve
+> business endpoints in later phases.
 
 ## Stack
 

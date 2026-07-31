@@ -112,7 +112,23 @@ operational for the mobile clients in the wild.
 
 E2E requires the embedded database to be running (`pnpm db:dev:start`).
 
-## 10. Future phases (reserved infrastructure)
+## 10. Supabase Auth (Phase 2)
+
+Mobile auth runs on **Supabase Auth** (email + password, PKCE, AsyncStorage
+session persistence) — it does not go through the NestJS API. This repo
+contributes the managed-side pieces:
+
+- `supabase/migrations/0001_profiles.sql` — `public.profiles` table,
+  signup trigger on `auth.users`, `updated_at` trigger, and RLS policies
+  (own-row select/update only).
+- `docs/SUPABASE_SETUP.md` — project configuration (email confirmation on,
+  redirect URLs for the `companion` scheme, password policy) and the manual
+  test checklist.
+
+The future NestJS API will validate Supabase JWTs (service-role key,
+server-side) for business endpoints.
+
+## 11. Future phases (reserved infrastructure)
 
 - `src/guards/` — JWT auth, roles
 - `src/decorators/` — `@CurrentUser()`, `@Public()`, `@Roles()`

@@ -29,3 +29,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 - Swagger/OpenAPI documentation at `/api/docs` (development only).
 - Unit tests (Jest) and end-to-end tests (supertest against the real DB).
 - Documentation: README, PROJECT_ARCHITECTURE, BACKEND_SETUP, src/ layout notes.
+
+### Phase 2 — Supabase Auth support (mobile)
+
+- Added `supabase/migrations/0001_profiles.sql`: `public.profiles` table
+  (defaults: verification `Pending`, rating 5.0, reliability 90,
+  `is_government_id_verified` / `is_student_verified` false), trigger-based
+  profile creation on `auth.users` insert (carries `full_name` / `phone`
+  from signup metadata), `updated_at` trigger, RLS restricted to own row.
+- Added `docs/SUPABASE_SETUP.md`: project creation, auth settings
+  (email signups + confirmation, password policy), redirect URLs for the
+  `companion` scheme, SQL application, and manual test checklist.
+- Note: authentication itself lives in the mobile client (Supabase Auth);
+  the NestJS API remains the Phase 3+ server for business endpoints.
