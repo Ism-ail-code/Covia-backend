@@ -1193,6 +1193,326 @@ async function main() {
   const expiredViaPolicy = await rideClient.query(`select count(*)::int as n from public.rides where ride_status = 'expired'`);
   assert(expiredViaPolicy.rows[0].n === 1, 'RLS policy allows reading expired rides');
 
+  // ── Phase 6: notifications, preferences, push tokens, realtime ────
+  const unread = async () => {
+    const r = await rideClient.query(`select public.get_unread_notification_count() as n`);
+    return Number(r.rows[0].n);
+  };
+  const notifRows = async (page = 1, pageSize = 20, unreadOnly = false, type = null) =>
+    rideClient.query(
+      `select * from public.get_notifications($1, $2, $3, $4)`,
+      [page, pageSize, unreadOnly, type],
+    );
+
+  // Baseline: read everything accumulated through Phases 4-5b so the
+  // remaining assertions count only Phase 6 activity. The rows stay in
+  // the feed, so baseline totals are captured for delta assertions.
+  const base = {};
+  for (const u of [user1, user2, user3]) {
+    await asUser(u);
+    await rideClient.query(`select * from public.mark_all_notifications_read()`);
+    const b = await notifRows(1, 1);
+    base[u] = Number(b.rows[0]?.total_count ?? 0);
+    assert((await unread()) === 0, 'baseline unread count is zero');
+  }
+
+  // Preferences defaults.
+  await asUser(user2);
+  const prefRow = await rideClient.query(`select * from public.get_notification_preferences()`);
+  assert(prefRow.rows[0].user_id === user2, 'preferences row belongs to the caller');
+  assert(prefRow.rows[0].ride_enabled === true && prefRow.rows[0].push_enabled === true, 'ride + push prefs default on');
+  assert(prefRow.rows[0].email_enabled === false && prefRow.rows[0].marketing_enabled === false, 'email + marketing prefs default off');
+  assert(prefRow.rows[0].verification_enabled === true && prefRow.rows[0].safety_enabled === true, 'verification + safety prefs default on');
+
+  // Creating/publishing a ride emits no notifications.
+  await asUser(user1);
+  const p6Row = await createLocRide({ hours: 50 });
+  const p6Id = p6Row.id;
+  await publishRide(p6Id);
+  assert((await unread()) === 0, 'draft creation + publish produce no notifications');
+
+  // Request → host receives ride_request_received.
+  await asUser(user2);
+  const p6Req = await rideClient.query(`select * from public.request_to_join($1)`, [p6Id]);
+  await asUser(user1);
+  const recv = await notifRows(1, 50, true);
+  assert(recv.rowCount === 1 && recv.rows[0].type === 'ride_request_received', 'host gets a ride request notification');
+  assert(recv.rows[0].actor_user_id === user2, 'request notification actor is the passenger');
+  assert(recv.rows[0].data?.request_id === p6Req.rows[0].id, 'request notification carries the request id');
+  assert(recv.rows[0].data?.passenger_id === user2, 'request notification carries the passenger id');
+  assert(recv.rows[0].message.includes('requested to join'), 'request notification message is user-friendly');
+  assert((await unread()) === 1, 'host unread count after the request');
+
+  // Approval → passenger gets approved, host gets passenger joined.
+  await asUser(user1);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [p6Req.rows[0].id]);
+  await asUser(user2);
+  const appr = await notifRows(1, 50, true);
+  assert(appr.rows[0].type === 'ride_request_approved' && appr.rows[0].data?.request_id === p6Req.rows[0].id, 'passenger gets an approval notification');
+  assert((await unread()) === 1, 'passenger unread after approval');
+  await asUser(user1);
+  const joinedN = await notifRows(1, 50, true);
+  assert(joinedN.rows[0].type === 'passenger_joined' && joinedN.rows[0].data?.passenger_id === user2, 'host gets a passenger joined notification');
+  assert(joinedN.rows[0].message.includes('joined your ride'), 'joined message names the passenger');
+  assert((await unread()) === 2, 'host unread count after approval');
+
+  // Second passenger: request + approval.
+  await asUser(user3);
+  const p6Req2 = await rideClient.query(`select * from public.request_to_join($1)`, [p6Id]);
+  await asUser(user1);
+  assert((await unread()) === 3, 'host unread count after second request');
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [p6Req2.rows[0].id]);
+  await asUser(user3);
+  const appr2 = await notifRows(1, 50, true);
+  assert(appr2.rows[0].type === 'ride_request_approved' && appr2.rows[0].data?.request_id === p6Req2.rows[0].id, 'second passenger gets an approval notification');
+  await asUser(user1);
+  assert((await unread()) === 4, 'host unread count after second approval');
+
+  // Edit → every member except the host gets ride_updated.
+  await asUser(user1);
+  await rideClient.query(
+    `select * from public.update_ride($1, null, null, $2, null, null, null)`,
+    [p6Id, 'Phase 6 notification test edit'],
+  );
+  await asUser(user2);
+  assert((await unread()) === 2, 'member gets a ride updated notification');
+  await asUser(user3);
+  const upd = await notifRows(1, 50, false, 'ride_updated');
+  assert(upd.rows[0].type === 'ride_updated' && upd.rows[0].message.includes('updated'), 'ride updated notification text');
+  assert((await unread()) === 2, 'second member gets a ride updated notification');
+
+  // Cancel → every member except the host gets ride_cancelled.
+  await asUser(user1);
+  await rideClient.query(`select * from public.cancel_ride($1)`, [p6Id]);
+  await asUser(user2);
+  const canc2 = await notifRows(1, 50, true);
+  assert(canc2.rows[0].type === 'ride_cancelled', 'member gets a ride cancelled notification');
+  assert((await unread()) === 3, 'member unread count after cancel');
+  await asUser(user3);
+  assert((await unread()) === 3, 'second member unread count after cancel');
+  await asUser(user1);
+  assert((await unread()) === 4, 'host (excluded from updates/cancel) still at 4');
+
+  // Feed: pagination, filtering, total_count, clamping.
+  await asUser(user2);
+  const feedP1 = await notifRows(1, 2);
+  assert(feedP1.rowCount === 2 && Number(feedP1.rows[0].total_count) === base[user2] + 3, 'feed paginates with a stable total_count');
+  assert(feedP1.rows[0].type === 'ride_cancelled', 'feed is newest-first');
+  const feedP2 = await notifRows(2, 2);
+  assert(feedP2.rowCount === 2 && feedP2.rows[0].type === 'ride_request_approved', 'second feed page continues in order');
+  const feedUnread = await notifRows(1, 50, true);
+  assert(feedUnread.rowCount === 3, 'unread-only filter returns unread rows');
+  const feedTyped = await notifRows(1, 50, false, 'ride_updated');
+  assert(feedTyped.rowCount >= 1 && feedTyped.rows.every((r) => r.type === 'ride_updated') && feedTyped.rows[0].is_read === false, 'type filter narrows the feed');
+  const feedClamped = await notifRows(1, 999);
+  assert(feedClamped.rowCount === base[user2] + 3 && feedClamped.rowCount <= 50, 'page size is clamped to 50');
+  const badType = await rideClient.query(`select * from public.get_notifications(1, 20, false, 'bogus_type')`)
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badType === 'string' && badType.includes('Unknown notification type'), 'invalid feed type filter rejected');
+
+  // Read + delete semantics.
+  const cancId = feedP1.rows[0].id;
+  const marked = await rideClient.query(`select * from public.mark_notification_read($1)`, [cancId]);
+  assert(marked.rows[0].is_read === true && marked.rows[0].read_at !== null, 'mark_notification_read flips the row');
+  assert((await unread()) === 2, 'unread count drops after marking read');
+  await asUser(user3);
+  const u3Canc = await notifRows(1, 50, false, 'ride_cancelled');
+  const u3CancId = u3Canc.rows[0].id;
+  await asUser(user2);
+  const foreignMark = await rideClient.query(`select * from public.mark_notification_read($1)`, [u3CancId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof foreignMark === 'string' && foreignMark.includes('Notification not found'), 'cannot mark another user\'s notification');
+  const readRowId = marked.rows[0].id;
+  await rideClient.query(`select * from public.delete_notification($1)`, [readRowId]);
+  const afterDel = await notifRows();
+  assert(Number(afterDel.rows[0].total_count) === base[user2] + 2, 'deleted notification leaves the feed');
+  const delForeign = await rideClient.query(`select * from public.delete_notification($1)`, [u3CancId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof delForeign === 'string' && delForeign.includes('Notification not found'), 'cannot delete another user\'s notification');
+  await rideClient.query(`select * from public.mark_all_notifications_read()`);
+  assert((await unread()) === 0, 'mark-all clears the unread badge');
+
+  // RLS on the notifications table: own rows only, no direct writes.
+  await asUser(user2);
+  const notifRls = await rideClient.query(`select count(*)::int as n from public.notifications where recipient_user_id = $1`, [user2]);
+  assert(notifRls.rows[0].n === base[user2] + 2, 'user reads only their own notifications');
+  const notifRlsHidden = await rideClient.query(`select count(*)::int as n from public.notifications where recipient_user_id = $1`, [user3]);
+  assert(notifRlsHidden.rows[0].n === 0, 'other users\' notifications are invisible');
+  const notifDirectWrite = await rideClient.query(
+    `insert into public.notifications (recipient_user_id, type, title) values ($1, 'welcome', 'x')`,
+    [user2],
+  ).then(() => null).catch((e) => e.code);
+  assert(notifDirectWrite === '42501', 'direct notification insert is denied');
+
+  // Preference gating: with ride_enabled off the recipient gets nothing.
+  await asUser(user3);
+  await rideClient.query(`select * from public.update_notification_preferences(p_ride_enabled => false)`);
+  const prefGated = await rideClient.query(`select * from public.get_notification_preferences()`);
+  assert(prefGated.rows[0].ride_enabled === false && prefGated.rows[0].push_enabled === true, 'partial preference update keeps other toggles');
+  await asUser(user1);
+  const n3Row = await createLocRide({ hours: 52 });
+  const n3Id = n3Row.id;
+  await publishRide(n3Id);
+  await asUser(user3);
+  const n3Req = await rideClient.query(`select * from public.request_to_join($1)`, [n3Id]);
+  await asUser(user1);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [n3Req.rows[0].id]);
+  await asUser(user3);
+  assert((await unread()) === 3, 'ride notification skipped for a recipient with ride_enabled off');
+  await rideClient.query(`select * from public.update_notification_preferences(p_ride_enabled => true)`);
+  assert((await unread()) === 3, 'preference flip alone does not backfill notifications');
+  await asUser(user1);
+  assert((await unread()) === 6, 'host notifications unaffected by passenger preferences');
+
+  // Push tokens: register, upsert-on-token, ownership move, remove.
+  await asUser(user2);
+  const tok1 = await rideClient.query(`select * from public.register_push_token($1, $2, $3)`, ['tok-bob-1', 'dev-1', 'android']);
+  assert(tok1.rows[0].token === 'tok-bob-1' && tok1.rows[0].user_id === user2, 'push token registered for the caller');
+  const tok1b = await rideClient.query(`select * from public.register_push_token($1, $2, $3)`, ['tok-bob-1', 'dev-2', 'ios']);
+  assert(tok1b.rows[0].platform === 'ios' && tok1b.rows[0].device_id === 'dev-2', 're-registering the same token updates device info');
+  await asUser(user3);
+  const tokMove = await rideClient.query(`select * from public.register_push_token($1)`, ['tok-bob-1']);
+  assert(tokMove.rows[0].user_id === user3, 'same token moves to the new owner on re-sign-in');
+  const badPlat = await rideClient.query(`select * from public.register_push_token($1, null, $2)`, ['tok-x', 'web'])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badPlat === 'string' && badPlat.includes('android or ios'), 'invalid platform rejected');
+  const longTok = await rideClient.query(`select * from public.register_push_token($1)`, ['x'.repeat(513)])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof longTok === 'string' && longTok.includes('too long'), 'oversized push token rejected');
+  const emptyTok = await rideClient.query(`select * from public.register_push_token($1)`, ['   '])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof emptyTok === 'string' && emptyTok.includes('required'), 'empty push token rejected');
+  const tok2 = await rideClient.query(`select * from public.register_push_token($1, null, $2)`, ['tok-bob-2', 'ios']);
+  assert(tok2.rows[0].user_id === user3, 'second token registered');
+  await rideClient.query(`select * from public.remove_push_token($1)`, ['tok-bob-2']);
+  await rideClient.query(`select * from public.remove_push_token($1)`, ['tok-bob-2']);
+  await rideClient.query('reset role');
+  const pushRemaining = await rideClient.query(`select user_id from public.push_tokens`);
+  await rideClient.query(`set role authenticated`);
+  assert(pushRemaining.rowCount === 1 && pushRemaining.rows[0].user_id === user3, 'remove_push_token is idempotent and removes only own tokens');
+
+  // Duplicate request notifications are blocked by the unique index.
+  const dupA = '00000000-0000-0000-0000-0000000000aa';
+  await rideClient.query('reset role');
+  await rideClient.query(
+    `insert into public.notifications (recipient_user_id, type, title, message, data)
+     values ($1, 'ride_request_received', 'd1', 'm1', $2)`,
+    [user3, JSON.stringify({ request_id: dupA })],
+  );
+  const dupB = await rideClient.query(
+    `insert into public.notifications (recipient_user_id, type, title, message, data)
+     values ($1, 'ride_request_received', 'd2', 'm2', $2)`,
+    [user3, JSON.stringify({ request_id: dupA })],
+  ).then(() => null).catch((e) => e.code);
+  assert(dupB === '23505', 'duplicate (recipient, type, request_id) notification blocked');
+  await rideClient.query(
+    `delete from public.notifications where recipient_user_id = $1 and data->>'request_id' = $2`,
+    [user3, dupA],
+  );
+  await rideClient.query(`set role authenticated`);
+
+  // Account lifecycle: welcome + email verified for a fresh signup.
+  const user4 = crypto.randomUUID();
+  await rideClient.query('reset role');
+  await rideClient.query(
+    `insert into auth.users (id, email, raw_user_meta_data) values
+       ($1, 'dora@example.com', '{"full_name":"Dora Example"}')`,
+    [user4],
+  );
+  const welcomeRows = await rideClient.query(
+    `select count(*)::int as n from public.notifications where recipient_user_id = $1 and type = 'welcome'`,
+    [user4],
+  );
+  assert(welcomeRows.rows[0].n === 1, 'signup creates a welcome notification');
+  await rideClient.query(
+    `update auth.users set email_confirmed_at = now() where id = $1`,
+    [user4],
+  );
+  const emailRows = await rideClient.query(
+    `select count(*)::int as n from public.notifications where recipient_user_id = $1 and type = 'email_verified'`,
+    [user4],
+  );
+  assert(emailRows.rows[0].n === 1, 'email confirmation creates an email_verified notification');
+  await rideClient.query(`set role authenticated`);
+  await asUser(user4);
+  assert((await unread()) === 2, 'new user sees welcome + email verified as unread');
+  const doraFeed = await notifRows();
+  assert(doraFeed.rowCount === 2 && Number(doraFeed.rows[0].total_count) === 2, 'new user feed is complete');
+  await rideClient.query(`select * from public.mark_all_notifications_read()`);
+  assert((await unread()) === 0, 'new user can read everything');
+
+  // Helper validation + internal functions stay client-inaccessible.
+  await asUser(user2);
+  const vtOk = await rideClient.query(`select public.is_valid_notification_type('ride_request_approved') as v`);
+  assert(vtOk.rows[0].v === true, 'valid notification type accepted');
+  const vtBad = await rideClient.query(`select public.is_valid_notification_type('bogus') as v`);
+  assert(vtBad.rows[0].v === false, 'invalid notification type rejected');
+  const directRec = await rideClient.query(`select public.record_notification($1, 'welcome', 'x', 'y')`, [user2])
+    .then(() => null).catch((e) => e.code);
+  assert(directRec === '42501', 'record_notification is not client-callable');
+  const directBcast = await rideClient.query(`select public.broadcast_covia_event('x', '{}')`)
+    .then(() => null).catch((e) => e.code);
+  assert(directBcast === '42501', 'broadcast_covia_event is not client-callable');
+  await rideClient.query('reset role');
+  const bogusType = await rideClient.query(`select public.record_notification($1, 'not_a_type', 'x', 'y')`, [user4])
+    .then(() => null).catch((e) => e.message ?? '');
+  await rideClient.query(`set role authenticated`);
+  assert(typeof bogusType === 'string' && bogusType.includes('Unknown notification type'), 'record_notification validates its type');
+
+  // Realtime event bus: covia_events NOTIFY + the supabase_realtime
+  // broadcast branch (guarded by publication presence).
+  const listenClient = new Client({ connectionString: `${DSN}/${TEST_DB}` });
+  await listenClient.connect();
+  const seen = [];
+  listenClient.on('notification', (m) => seen.push(m));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  await listenClient.query('listen covia_events');
+  await sleep(250);
+  await rideClient.query('reset role');
+  const pubCount = await rideClient.query(`select count(*)::int as n from pg_publication where pubname = 'supabase_realtime'`);
+  await rideClient.query(`set role authenticated`);
+  assert(pubCount.rows[0].n === 0, 'test DB starts without the supabase_realtime publication');
+
+  await asUser(user1);
+  const n4Row = await createLocRide({ hours: 54 });
+  const n4Id = n4Row.id;
+  await publishRide(n4Id);
+  await rideClient.query(
+    `select * from public.update_ride($1, null, null, $2, null, null, null)`,
+    [n4Id, 'realtime test edit'],
+  );
+  await sleep(500);
+  const gotUpdated = seen.some((m) => m.channel === 'covia_events' && JSON.parse(m.payload).event === 'covia.ride.updated');
+  assert(gotUpdated, 'edit broadcasts covia.ride.updated on covia_events');
+  await rideClient.query(`select * from public.cancel_ride($1)`, [n4Id]);
+  await sleep(500);
+  const gotCancelled = seen.some((m) => m.channel === 'covia_events' && JSON.parse(m.payload).event === 'covia.ride.cancelled');
+  assert(gotCancelled, 'cancel broadcasts covia.ride.cancelled on covia_events');
+
+  // With the publication present the same event also goes to the
+  // supabase_realtime broadcast channel.
+  await rideClient.query('reset role');
+  await rideClient.query(`create publication supabase_realtime`);
+  await rideClient.query(`set role authenticated`);
+  await listenClient.query('listen supabase_realtime');
+  await sleep(250);
+  await asUser(user1);
+  const n5Row = await createLocRide({ hours: 56 });
+  const n5Id = n5Row.id;
+  await publishRide(n5Id);
+  await rideClient.query(
+    `select * from public.update_ride($1, null, null, $2, null, null, null)`,
+    [n5Id, 'realtime dual channel edit'],
+  );
+  await sleep(500);
+  const gotDual = seen.filter((m) => JSON.parse(m.payload).event === 'covia.ride.updated');
+  assert(gotDual.some((m) => m.channel === 'covia_events') && gotDual.some((m) => m.channel === 'supabase_realtime'), 'broadcast reaches both channels when the publication exists');
+  await rideClient.query('reset role');
+  await rideClient.query(`drop publication supabase_realtime`);
+  await rideClient.query(`set role authenticated`);
+  await listenClient.end();
+  await sleep(100);
+
   await rideClient.query('reset role');
   await rideClient.end();
 
