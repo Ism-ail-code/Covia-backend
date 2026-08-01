@@ -49,9 +49,9 @@ create table if not exists public.chat_messages (
   edited_at timestamptz,
   deleted_at timestamptz,           -- soft delete: row stays, body hidden
   constraint chat_messages_text_requires_body
-    check (message_type <> 'text' or message is not null),
+    check (message_type <> 'text' or message is not null or deleted_at is not null),
   constraint chat_messages_image_requires_media
-    check (message_type <> 'image' or media_url is not null),
+    check (message_type <> 'image' or media_url is not null or deleted_at is not null),
   constraint chat_messages_system_has_no_sender
     check (message_type <> 'system' or sender_id is null),
   constraint chat_messages_system_has_body
@@ -387,6 +387,43 @@ $$;
 drop function if exists public.update_notification_preferences(
   boolean, boolean, boolean, boolean, boolean, boolean
 );
+
+-- The feed's type filter must accept the chat vocabulary.
+alter table public.notifications drop constraint notifications_type_check;
+alter table public.notifications add constraint notifications_type_check check (type in (
+  'ride_request_received', 'ride_request_approved', 'ride_request_rejected',
+  'passenger_joined', 'passenger_left', 'passenger_removed',
+  'ride_updated', 'ride_cancelled', 'ride_started', 'ride_completed',
+  'ride_expired',
+  'chat_message', 'chat_image',
+  'verification_submitted', 'verification_approved', 'verification_rejected',
+  'resubmission_requested',
+  'welcome', 'password_changed', 'email_verified',
+  'safety_check', 'emergency_alert',
+  'marketing'
+));
+
+create or replace function public.is_valid_notification_type(p_type text)
+returns boolean
+language sql
+immutable
+set search_path = public
+as $$
+  select p_type in (
+    'ride_request_received', 'ride_request_approved', 'ride_request_rejected',
+    'passenger_joined', 'passenger_left', 'passenger_removed',
+    'ride_updated', 'ride_cancelled', 'ride_started', 'ride_completed',
+    'ride_expired',
+    'chat_message', 'chat_image',
+    'verification_submitted', 'verification_approved', 'verification_rejected',
+    'resubmission_requested',
+    'welcome', 'password_changed', 'email_verified',
+    'safety_check', 'emergency_alert', 'marketing'
+  );
+$$;
+
+revoke all on function public.is_valid_notification_type(text) from public;
+grant execute on function public.is_valid_notification_type(text) to authenticated;
 
 revoke all on function public.get_notification_preferences() from public;
 revoke all on function public.update_notification_preferences(boolean, boolean, boolean, boolean, boolean, boolean, boolean) from public;

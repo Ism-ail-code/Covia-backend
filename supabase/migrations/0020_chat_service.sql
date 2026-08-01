@@ -114,7 +114,9 @@ begin
            (
              select count(*)::bigint
              from public.ride_participants p
-             where p.ride_id = r.id and p.left_at is null
+             where p.ride_id = r.id
+               and p.role = 'Passenger'
+               and p.left_at is null
            ) + 1::bigint as participant_count
     from public.ride_chats rc
     join public.rides r on r.id = rc.ride_id
@@ -159,12 +161,17 @@ begin
   return query
     select m.id, m.chat_id, m.sender_id, pr.display_name as sender_name,
            m.message_type, m.message, m.media_url, m.sent_at, m.edited_at,
+             (
+               select count(*)::bigint
+               from public.message_reads mr
+               where mr.message_id = m.id
+             ) as read_count,
            (
              select count(*)::bigint
-             from public.message_reads mr
-             where mr.message_id = m.id
-           ) as read_count,
-           count(*) over ()::bigint as total_count
+             from public.chat_messages allm
+             where allm.chat_id = p_chat_id
+               and allm.deleted_at is null
+           ) as total_count
     from public.chat_messages m
     left join public.profiles pr on pr.id = m.sender_id
     where m.chat_id = p_chat_id
@@ -350,7 +357,7 @@ begin
   from public.chat_messages m
   where m.chat_id = p_chat_id
     and m.deleted_at is null
-    and (p_through is null or m.sent_at <= p_through)
+      and (p_through is null or m.sent_at <= p_through + interval '1 millisecond')
     and not exists (
       select 1 from public.message_reads r
       where r.message_id = m.id and r.user_id = v_user
@@ -602,6 +609,7 @@ begin
       select p.user_id
       from public.ride_participants p
       where p.ride_id = v_chat.ride_id
+        and p.role = 'Passenger'
         and p.left_at is null
         and p.user_id is distinct from new.sender_id
     loop
