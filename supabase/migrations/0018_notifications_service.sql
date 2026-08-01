@@ -366,6 +366,7 @@ declare
   v_message text;
   v_data jsonb;
   v_recipient uuid;
+  v_type text;
   v_reason text;
 begin
   begin
@@ -426,11 +427,18 @@ begin
         );
 
       when 'joined' then
-        -- passenger confirmed on board → host
+        -- passenger confirmed on board → host. The timeline records the
+        -- host as actor when approval adds the passenger, so resolve the
+        -- passenger name from metadata instead of the event actor.
+        v_passenger_id := nullif(new.metadata ->> 'passenger_id', '')::uuid;
+        v_passenger_id := coalesce(v_passenger_id, new.actor_id);
+        select display_name into v_actor_name
+          from public.profiles where id = v_passenger_id;
+        v_actor_name := coalesce(nullif(v_actor_name, ''), 'Someone');
         v_recipient := v_host_id;
         v_title := 'Passenger joined';
         v_message := v_actor_name || ' joined your ride to ' || v_destination;
-        v_data := jsonb_build_object('ride_id', new.ride_id, 'passenger_id', new.actor_id);
+        v_data := jsonb_build_object('ride_id', new.ride_id, 'passenger_id', v_passenger_id);
 
       when 'left' then
         -- passenger left → host
@@ -545,9 +553,21 @@ begin
         return new;
     end case;
 
+    -- Timeline event names map to the notification vocabulary used by
+    -- record_notification() (the two lexicons must stay in sync).
+    v_type := case new.event_type
+      when 'requested' then 'ride_request_received'
+      when 'approved' then 'ride_request_approved'
+      when 'rejected' then 'ride_request_rejected'
+      when 'joined' then 'passenger_joined'
+      when 'left' then 'passenger_left'
+      when 'dropped' then 'passenger_removed'
+      when 'expired' then 'ride_expired'
+    end case;
+
     if v_recipient is not null then
       perform public.record_notification(
-        v_recipient, new.event_type, v_title, v_message, v_data, new.actor_id
+        v_recipient, v_type, v_title, v_message, v_data, new.actor_id
       );
     end if;
 
