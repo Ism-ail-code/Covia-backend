@@ -1,4 +1,4 @@
-﻿/**
+/**
  * SQL smoke test for the Supabase migrations.
  *
  * Boots a scratch database in the local embedded PostgreSQL (see
@@ -1813,6 +1813,400 @@ async function main() {
     'participant sees exactly the chats they belong to (not n3 / other rides)');
   const rlsMsgsOther = await rideClient.query(`select count(*)::int as n from public.chat_messages where chat_id = $1`, [n3ChatId]);
   assert(rlsMsgsOther.rows[0].n === 0, 'participant cannot see messages from chats they are not in');
+
+  // ── Phase 8: safety, emergency & trust ──────────────────────────────
+  const cnt = async (u, type) => {
+    await asUser(u);
+    const r = await notifRows(1, 1, false, type);
+    return Number(r.rows[0]?.total_count ?? 0);
+  };
+  const listenFor = async () => {
+    const c = new Client({ connectionString: `${DSN}/${TEST_DB}` });
+    await c.connect();
+    const seen = [];
+    c.on('notification', (m) => seen.push(m));
+    await c.query('listen covia_events');
+    await sleep(250);
+    return { client: c, seen, end: async () => c.end() };
+  };
+  const gotEvent = (seen, name, rideId) => seen.some((m) => m.channel === 'covia_events'
+    && JSON.parse(m.payload).event === name
+    && (rideId === undefined || JSON.parse(m.payload).payload.ride_id === rideId));
+
+  // Emergency contacts: add / update / delete + validation + RLS.
+  await asUser(user1);
+  const mom = await rideClient.query(`select * from public.add_emergency_contact($1, $2, $3, $4)`, ['Mom', '+2348012345678', 'Mother', true]);
+  assert(mom.rows[0].is_primary === true && mom.rows[0].name === 'Mom', 'a primary contact can be added');
+  const dad = await rideClient.query(`select * from public.add_emergency_contact($1, $2, $3)`, ['Dad', '+234 901 2345 678', 'Father']);
+  const mate = await rideClient.query(`select * from public.add_emergency_contact($1, $2, $3)`, ['Roommate', '+15551234567', 'Friend']);
+  assert(mate.rows[0].is_primary === false, 'extra contacts are non-primary by default');
+  const ecBadName = await rideClient.query(`select * from public.add_emergency_contact($1, $2, $3)`, ['  ', '+2348012345678', 'Mother'])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof ecBadName === 'string' && ecBadName.includes('A contact name is required'), 'contact name is validated');
+  const ecBadPhone = await rideClient.query(`select * from public.add_emergency_contact($1, $2, $3)`, ['X', 'call me', 'Mother'])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof ecBadPhone === 'string' && ecBadPhone.includes('A valid phone number is required'), 'contact phone is validated');
+  const ecBadRel = await rideClient.query(`select * from public.add_emergency_contact($1, $2, $3)`, ['X', '+2348012345678', ' '])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof ecBadRel === 'string' && ecBadRel.includes('A relationship is required'), 'contact relationship is validated');
+  const newPrimary = await rideClient.query(`select * from public.add_emergency_contact($1, $2, $3, $4)`, ['Sister', '+2348123456789', 'Sibling', true]);
+  const momNow = await rideClient.query(`select is_primary from public.emergency_contacts where id = $1`, [mom.rows[0].id]);
+  assert(momNow.rows[0].is_primary === false, 'adding a new primary demotes the old one');
+  const list1 = await rideClient.query(`select * from public.get_emergency_contacts()`);
+  assert(list1.rows.length === 4 && list1.rows[0].id === newPrimary.rows[0].id, 'contacts list primary first');
+  const contactUpd = await rideClient.query(`select * from public.update_emergency_contact($1, $2, $3)`, [dad.rows[0].id, 'Dad', '+2348011122233']);
+  assert(contactUpd.rows[0].phone === '+2348011122233', 'contact phone can be updated');
+  const updBadPhone = await rideClient.query(`select * from public.update_emergency_contact($1, $2, $3)`, [dad.rows[0].id, 'Dad', 'call me'])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof updBadPhone === 'string' && updBadPhone.includes('A valid phone number is required'), 'update validates the phone');
+  await asUser(user2);
+  const updOther = await rideClient.query(`select * from public.update_emergency_contact($1, $2)`, [dad.rows[0].id, 'Nope'])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof updOther === 'string' && updOther.includes('Contact not found'), 'contacts cannot be edited by other users');
+  const delOther = await rideClient.query(`select * from public.delete_emergency_contact($1)`, [mom.rows[0].id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof delOther === 'string' && delOther.includes('Contact not found'), 'contacts cannot be deleted by other users');
+  await asUser(user1);
+  await rideClient.query(`select * from public.delete_emergency_contact($1)`, [mate.rows[0].id]);
+  const list2 = await rideClient.query(`select * from public.get_emergency_contacts()`);
+  assert(list2.rows.length === 3, 'a contact can be deleted by its owner');
+  const ecRLS = await rideClient.query(`select count(*)::int as n from public.emergency_contacts where user_id = $1`, [user2]);
+  assert(ecRLS.rows[0].n === 0, 'RLS hides contacts from other users');
+  const ecInsert = await rideClient.query(`insert into public.emergency_contacts (user_id, name, phone, relationship) values ($1, 'X', '+2348012345678', 'X')`, [user1])
+    .then(() => null).catch((e) => e.code);
+  assert(ecInsert === '42501', 'direct contact insert is denied');
+
+  // user2's contacts drive the SOS + escalation outbound assertions.
+  await asUser(user2);
+  await rideClient.query(`select * from public.add_emergency_contact($1, $2, $3, $4)`, ['Brother', '+2347000000001', 'Sibling', true]);
+  await rideClient.query(`select * from public.add_emergency_contact($1, $2, $3)`, ['Sister', '+2347000000002', 'Sibling']);
+
+  // Safety config: readable defaults; mutations are server-only.
+  const safetyCfg = await rideClient.query(`select * from public.get_safety_config()`);
+  assert(Number(safetyCfg.rows[0].route_deviation_meters) === 500 && safetyCfg.rows[0].stop_threshold_seconds === 120, 'deviation + stop thresholds default');
+  assert(safetyCfg.rows[0].safety_check_timeout_seconds === 60 && safetyCfg.rows[0].never_started_minutes === 15, 'escalation + never-started thresholds default');
+  assert(safetyCfg.rows[0].exceeded_duration_minutes === 45 && safetyCfg.rows[0].notify_participants_on_sos === true, 'duration + sos notify defaults');
+  assert(safetyCfg.rows[0].sos_repeat_window_seconds === 120 && safetyCfg.rows[0].live_location_retention_hours === 24, 'sos window + retention defaults');
+  const cfgWrite = await rideClient.query(`select * from public.update_safety_config(p_stop_threshold_seconds => 1)`)
+    .then(() => null).catch((e) => e.code);
+  assert(cfgWrite === '42501', 'clients cannot change safety config');
+  const cfgTable = await rideClient.query(`update public.safety_config set stop_threshold_seconds = 1`)
+    .then(() => null).catch((e) => e.code);
+  assert(cfgTable === '42501', 'safety config is not directly writable');
+
+  // Active ride for monitoring + SOS tests.
+  await asUser(user1);
+  const p8Row = await createLocRide({ hours: 72 });
+  const p8Id = p8Row.id;
+  await publishRide(p8Id);
+  await asUser(user2);
+  const p8Req2 = await rideClient.query(`select * from public.request_to_join($1)`, [p8Id]);
+  await asUser(user1);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [p8Req2.rows[0].id]);
+  await asUser(user3);
+  const p8Req3 = await rideClient.query(`select * from public.request_to_join($1)`, [p8Id]);
+  await asUser(user1);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [p8Req3.rows[0].id]);
+  const monPre = await rideClient.query(`select count(*)::int as n from public.ride_monitoring where ride_id = $1`, [p8Id]);
+  assert(monPre.rows[0].n === 0, 'no monitoring before the ride starts');
+  await rideClient.query(`select * from public.start_ride($1)`, [p8Id]);
+  const monStart = await rideClient.query(`select * from public.ride_monitoring where ride_id = $1`, [p8Id]);
+  assert(monStart.rows[0].status === 'active' && monStart.rows[0].started_at !== null, 'starting a ride activates monitoring');
+
+  // Second ride: sos-gate + duration-exceeded tests. Third ride: never-started.
+  const p8bRow = await createLocRide({ hours: 80 });
+  const p8bId = p8bRow.id;
+  await publishRide(p8bId);
+  await asUser(user2);
+  const p8bReq = await rideClient.query(`select * from public.request_to_join($1)`, [p8bId]);
+  await asUser(user1);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [p8bReq.rows[0].id]);
+  await rideClient.query(`select * from public.start_ride($1)`, [p8bId]);
+  const p8cRow = await createLocRide({ hours: 88 });
+  const p8cId = p8cRow.id;
+  await publishRide(p8cId);
+
+  // Live location sharing + RLS (before the route exists, so no deviation).
+  await asUser(user2);
+  const share2 = await rideClient.query(`select * from public.update_live_location($1, $2)`, [p8Id, JSON.stringify({ lat: 6.51, lng: 3.37, speed: 0 })]);
+  assert(share2.rows[0].user_id === user2 && share2.rows[0].is_active === true, 'a passenger can share their location');
+  await asUser(user3);
+  await rideClient.query(`select * from public.update_live_location($1, $2)`, [p8Id, JSON.stringify({ lat: 6.5, lng: 3.36, speed: 0 })]);
+  await asUser(user1);
+  const locsVisible = await rideClient.query(`select count(*)::int as n from public.live_locations where ride_id = $1`, [p8Id]);
+  assert(locsVisible.rows[0].n === 2, 'participants see each others live locations');
+  await asUser(user4);
+  const locsHidden = await rideClient.query(`select count(*)::int as n from public.live_locations where ride_id = $1`, [p8Id]);
+  assert(locsHidden.rows[0].n === 0, 'RLS hides live locations from outsiders');
+  await asUser(user2);
+  const locInvalid = await rideClient.query(`select * from public.update_live_location($1, $2)`, [p8Id, JSON.stringify({ lng: 3.37 })])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof locInvalid === 'string' && locInvalid.includes('A valid location is required'), 'invalid locations are rejected');
+  await asUser(user3);
+  const locInactive = await rideClient.query(`select * from public.update_live_location($1, $2)`, [n3Id, JSON.stringify({ lat: 6.5, lng: 3.36 })])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof locInactive === 'string' && locInactive.includes('Live location is only shared during an active ride'), 'sharing requires an active ride');
+  await rideClient.query(`select * from public.stop_live_location($1)`, [p8Id]);
+  const locsAfterStop = await rideClient.query(`select count(*)::int as n from public.live_locations where ride_id = $1`, [p8Id]);
+  assert(locsAfterStop.rows[0].n === 1, 'a passenger can stop sharing their location');
+  const locInsert = await rideClient.query(`insert into public.live_locations (ride_id, user_id, location) values ($1, $2, '{"lat":6.5,"lng":3.36}')`, [p8Id, user2])
+    .then(() => null).catch((e) => e.code);
+  assert(locInsert === '42501', 'direct live-location insert is denied');
+
+  // Planned route (host-only, validated).
+  await asUser(user2);
+  const routeByPassenger = await rideClient.query(`select * from public.set_planned_route($1, $2)`, [p8Id, JSON.stringify([{ lat: 6.5, lng: 3.3 }, { lat: 6.5, lng: 3.42 }])])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof routeByPassenger === 'string' && routeByPassenger.includes('Only the host can set the planned route'), 'passengers cannot set the route');
+  await asUser(user1);
+  const routeShort = await rideClient.query(`select * from public.set_planned_route($1, $2)`, [p8Id, JSON.stringify([{ lat: 6.5, lng: 3.3 }])])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof routeShort === 'string' && routeShort.includes('at least two points'), 'a route needs at least two points');
+  const routeNoLat = await rideClient.query(`select * from public.set_planned_route($1, $2)`, [p8Id, JSON.stringify([{ lng: 3.3 }, { lat: 6.5, lng: 3.42 }])])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof routeNoLat === 'string' && routeNoLat.includes('lat/lng coordinates'), 'route points need coordinates');
+  await rideClient.query(`select * from public.set_planned_route($1, $2)`, [p8Id, JSON.stringify([{ lat: 6.5, lng: 3.3 }, { lat: 6.5, lng: 3.42 }])]);
+
+  // SOS: one tap, broadcast, notifications, outbound queue, idempotency.
+  const sosBaseline = { host: await cnt(user1, 'emergency_alert'), p2: await cnt(user2, 'emergency_alert'), p3: await cnt(user3, 'emergency_alert') };
+  const sosListen = await listenFor();
+  await asUser(user2);
+  const sos1 = await rideClient.query(`select * from public.trigger_sos($1, $2)`, [p8Id, JSON.stringify({ lat: 6.51, lng: 3.37 })]);
+  await sleep(500);
+  assert(sos1.rows[0].event_type === 'sos' && sos1.rows[0].severity === 'critical', 'SOS creates a critical event');
+  assert(Number(sos1.rows[0].location.lat) === 6.51 && sos1.rows[0].resolved_at === null, 'SOS records the pressed location');
+  assert(gotEvent(sosListen.seen, 'covia.safety.sos', p8Id), 'SOS broadcasts covia.safety.sos');
+  const sosDup = await rideClient.query(`select * from public.trigger_sos($1, $2)`, [p8Id, JSON.stringify({ lat: 6.51, lng: 3.37 })]);
+  assert(sosDup.rows[0].id === sos1.rows[0].id, 'duplicate SOS returns the same event (idempotent)');
+  assert(await cnt(user1, 'emergency_alert') === sosBaseline.host + 1, 'host is notified of the SOS');
+  assert(await cnt(user3, 'emergency_alert') === sosBaseline.p3 + 1, 'fellow passengers are notified of the SOS');
+  assert(await cnt(user2, 'emergency_alert') === sosBaseline.p2, 'the SOS sender is not notified');
+  await rideClient.query('reset role');
+  const outbound = await rideClient.query(
+    `select * from public.outbound_notifications where kind = 'sos_alert' and payload->>'ride_id' = $1`, [p8Id]);
+  await rideClient.query('set role authenticated');
+  assert(outbound.rowCount === 2 && outbound.rows.every((r) => r.sent_at === null), 'SOS queues one SMS per emergency contact');
+  assert(outbound.rows.some((r) => r.recipient_name === 'Brother'), 'outbound row names the primary contact');
+  await sosListen.end();
+  await asUser(user4);
+  const sosOutsider = await rideClient.query(`select * from public.trigger_sos($1, $2)`, [p8Id, JSON.stringify({ lat: 6.5, lng: 3.36 })])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof sosOutsider === 'string' && sosOutsider.includes('You are not on this ride'), 'outsiders cannot trigger SOS');
+  await asUser(user3);
+  const sosInactive = await rideClient.query(`select * from public.trigger_sos($1)`, [n3Id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof sosInactive === 'string' && sosInactive.includes('SOS is only available during an active ride'), 'SOS requires an active ride');
+
+  // SOS participant notifications are config-gated.
+  await rideClient.query('reset role');
+  await rideClient.query(`select * from public.update_safety_config(p_notify_participants_on_sos => false)`);
+  await rideClient.query('set role authenticated');
+  const gateHost = await cnt(user1, 'emergency_alert');
+  await asUser(user2);
+  const sosGate = await rideClient.query(`select * from public.trigger_sos($1)`, [p8bId]);
+  assert(sosGate.rows[0].event_type === 'sos', 'SOS still fires when notifications are gated off');
+  assert(await cnt(user1, 'emergency_alert') === gateHost, 'gated SOS notifies no participants');
+  await rideClient.query('reset role');
+  await rideClient.query(`select * from public.update_safety_config(p_notify_participants_on_sos => true)`);
+  await rideClient.query('set role authenticated');
+
+  // Route deviation → "Are you safe?" prompt.
+  await asUser(user2);
+  const devListen = await listenFor();
+  const devDelta = await cnt(user2, 'safety_check');
+  await rideClient.query(`select * from public.update_live_location($1, $2)`, [p8Id, JSON.stringify({ lat: 6.55, lng: 3.36, speed: 8 })]);
+  await sleep(500);
+  const devEvent = await rideClient.query(
+    `select * from public.safety_events where ride_id = $1 and event_type = 'safety_check' order by created_at desc limit 1`, [p8Id]);
+  assert(devEvent.rows[0].metadata.check_kind === 'route_deviation', 'an off-route move raises a route_deviation check');
+  assert(gotEvent(devListen.seen, 'covia.safety.check_required', p8Id), 'deviation broadcasts check_required');
+  assert(await cnt(user2, 'safety_check') === devDelta + 1, 'the rider is asked to confirm they are safe');
+  await devListen.end();
+
+  // "I'm Safe" needs biometric confirmation; plain taps are rejected.
+  const bioError = await rideClient.query(`select * from public.respond_safety_check($1, true, false)`, [p8Id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof bioError === 'string' && bioError.includes('Biometric confirmation is required'), 'a tap cannot dismiss the alert');
+  const resolvedListen = await listenFor();
+  const resolved = await rideClient.query(`select * from public.respond_safety_check($1, true, true)`, [p8Id]);
+  await sleep(500);
+  assert(resolved.rows[0].event_type === 'safety_confirmed' && resolved.rows[0].metadata.confirmed_by_biometric === true, 'biometric confirmation resolves the alert');
+  const checkCleared = await rideClient.query(`select check_required_at from public.ride_monitoring where ride_id = $1`, [p8Id]);
+  assert(checkCleared.rows[0].check_required_at === null, 'the open prompt is cleared');
+  assert(gotEvent(resolvedListen.seen, 'covia.safety.resolved', p8Id), 'confirmation broadcasts covia.safety.resolved');
+  await resolvedListen.end();
+
+  // Unexpected stop → prompt (with a tuned-down stop threshold).
+  await rideClient.query('reset role');
+  await rideClient.query(`select * from public.update_safety_config(p_stop_threshold_seconds => 1)`);
+  await rideClient.query('set role authenticated');
+  await asUser(user2);
+  await rideClient.query(`select * from public.update_live_location($1, $2)`, [p8Id, JSON.stringify({ lat: 6.5, lng: 3.36, speed: 0 })]);
+  await sleep(1200);
+  await rideClient.query(`select * from public.update_live_location($1, $2)`, [p8Id, JSON.stringify({ lat: 6.5, lng: 3.36, speed: 0 })]);
+  const stopEvent = await rideClient.query(
+    `select * from public.safety_events where ride_id = $1 and event_type = 'safety_check' order by created_at desc limit 1`, [p8Id]);
+  assert(stopEvent.rows[0].metadata.check_kind === 'long_stop', 'a stationary ride raises a long_stop check');
+
+  // "Need Help" escalates immediately (repeat window opened for a fresh SOS).
+  const helpBaseline = { host: await cnt(user1, 'emergency_alert'), p3: await cnt(user3, 'emergency_alert') };
+  await rideClient.query('reset role');
+  await rideClient.query(`select * from public.update_safety_config(p_sos_repeat_window_seconds => 0)`);
+  await rideClient.query('set role authenticated');
+  await asUser(user2);
+  const help = await rideClient.query(`select * from public.respond_safety_check($1, false)`, [p8Id]);
+  assert(help.rows[0].event_type === 'sos' && help.rows[0].metadata.source === 'safety_check_response', 'Need Help raises a fresh SOS');
+  assert(help.rows[0].id !== sos1.rows[0].id, 'Need Help is not a duplicate SOS');
+  const helpMon = await rideClient.query(`select check_required_at, escalated_at from public.ride_monitoring where ride_id = $1`, [p8Id]);
+  assert(helpMon.rows[0].check_required_at === null && helpMon.rows[0].escalated_at !== null, 'the prompt is cleared and the ride is flagged');
+  assert(await cnt(user1, 'emergency_alert') === helpBaseline.host + 1, 'participants are alerted on Need Help');
+  assert(await cnt(user3, 'emergency_alert') === helpBaseline.p3 + 1, 'fellow passengers are alerted on Need Help');
+
+  // SOS without a pressed location falls back to the last known position.
+  const fallback = await rideClient.query(`select * from public.trigger_sos($1)`, [p8Id]);
+  assert(Number(fallback.rows[0].location.lat) === 6.5, 'SOS falls back to the last known location');
+
+  // Timeout → emergency escalation (monitor engine: escalation, never-started, duration).
+  await asUser(user2);
+  await rideClient.query(`select * from public.update_live_location($1, $2)`, [p8Id, JSON.stringify({ lat: 6.5, lng: 3.36, speed: 0 })]);
+  const escCheck = await rideClient.query(
+    `select * from public.safety_events where ride_id = $1 and event_type = 'safety_check' order by created_at desc limit 1`, [p8Id]);
+  const escBaseline = { host: await cnt(user1, 'emergency_alert'), p3: await cnt(user3, 'emergency_alert'), hostSafety: await cnt(user1, 'safety_check') };
+  await rideClient.query('reset role');
+  await rideClient.query(`select * from public.update_safety_config(p_safety_check_timeout_seconds => 1)`);
+  await rideClient.query(`update public.rides set departure_time = now() - interval '7 hours' where id = $1`, [p8bId]);
+  await rideClient.query(`update public.rides set departure_time = now() - interval '1 hour' where id = $1`, [p8cId]);
+  const monListen = await listenFor();
+  await sleep(1300);
+  const monitorRes = await rideClient.query(`select public.run_safety_monitor() as actions`);
+  await rideClient.query('set role authenticated');
+  await sleep(500);
+  assert(Number(monitorRes.rows[0].actions) >= 3, 'the monitor engine takes action');
+  const escEvent = await rideClient.query(
+    `select * from public.safety_events where ride_id = $1 and event_type = 'emergency_escalation'`, [p8Id]);
+  assert(escEvent.rows[0].severity === 'critical' && escEvent.rows[0].user_id === user2, 'an unanswered prompt escalates');
+  assert(escEvent.rows[0].metadata.check_event_id === escCheck.rows[0].id, 'escalation links the unanswered check');
+  assert(gotEvent(monListen.seen, 'covia.safety.escalated', p8Id), 'escalation broadcasts covia.safety.escalated');
+  assert(await cnt(user1, 'emergency_alert') === escBaseline.host + 1, 'escalation alerts the host');
+  assert(await cnt(user3, 'emergency_alert') === escBaseline.p3 + 1, 'escalation alerts the passengers');
+  await rideClient.query('reset role');
+  const escOut = await rideClient.query(
+    `select * from public.outbound_notifications where kind = 'escalation_alert' and payload->>'ride_id' = $1`, [p8Id]);
+  assert(escOut.rowCount === 2, 'escalation queues SMS rows for the contacts');
+  const neverEvt = await rideClient.query(
+    `select * from public.safety_events where ride_id = $1 and event_type = 'ride_never_started'`, [p8cId]);
+  assert(neverEvt.rows[0].user_id === user1, 'a ride that never starts is flagged');
+  const durEvt = await rideClient.query(
+    `select * from public.safety_events where ride_id = $1 and event_type = 'ride_duration_exceeded'`, [p8bId]);
+  assert(durEvt.rows[0].user_id === user1, 'an over-duration ride is flagged');
+  await rideClient.query('set role authenticated');
+  assert(gotEvent(monListen.seen, 'covia.safety.ride_never_started', p8cId), 'never-started broadcasts its event');
+  assert(gotEvent(monListen.seen, 'covia.safety.ride_duration_exceeded', p8bId), 'duration-exceeded broadcasts its event');
+  assert(await cnt(user1, 'safety_check') === escBaseline.hostSafety + 2, 'host is notified of never-started + duration issues');
+  await monListen.end();
+
+  // Suspension pauses detection (sharing continues); host-only control.
+  await asUser(user2);
+  const suspPass = await rideClient.query(`select * from public.suspend_ride_monitoring($1)`, [p8Id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof suspPass === 'string' && suspPass.includes('Only the host can control ride monitoring'), 'passengers cannot suspend monitoring');
+  const checksBefore = await rideClient.query(
+    `select count(*)::int as n from public.safety_events where ride_id = $1 and event_type = 'safety_check'`, [p8Id]);
+  await asUser(user1);
+  await rideClient.query(`select * from public.suspend_ride_monitoring($1)`, [p8Id]);
+  const suspTwice = await rideClient.query(`select * from public.suspend_ride_monitoring($1)`, [p8Id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof suspTwice === 'string' && suspTwice.includes('No active monitoring'), 'monitoring cannot be suspended twice');
+  await asUser(user2);
+  await rideClient.query(`select * from public.update_live_location($1, $2)`, [p8Id, JSON.stringify({ lat: 6.5, lng: 3.36, speed: 0 })]);
+  const checksAfter = await rideClient.query(
+    `select count(*)::int as n from public.safety_events where ride_id = $1 and event_type = 'safety_check'`, [p8Id]);
+  assert(checksAfter.rows[0].n === checksBefore.rows[0].n, 'suspended monitoring skips detection');
+  const resumePass = await rideClient.query(`select * from public.resume_ride_monitoring($1)`, [p8Id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof resumePass === 'string' && resumePass.includes('Only the host can control ride monitoring'), 'passengers cannot resume monitoring');
+  await asUser(user1);
+  await rideClient.query(`select * from public.resume_ride_monitoring($1)`, [p8Id]);
+  const resumeTwice = await rideClient.query(`select * from public.resume_ride_monitoring($1)`, [p8Id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof resumeTwice === 'string' && resumeTwice.includes('Monitoring is not suspended'), 'monitoring cannot be resumed twice');
+
+  // Manual incident report.
+  await asUser(user4);
+  const incidentOutsider = await rideClient.query(`select * from public.report_safety_incident($1, $2)`, [p8Id, 'test'])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof incidentOutsider === 'string' && incidentOutsider.includes('You are not on this ride'), 'outsiders cannot report incidents');
+  await asUser(user2);
+  const incidentBlank = await rideClient.query(`select * from public.report_safety_incident($1, $2)`, [p8Id, '  '])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof incidentBlank === 'string' && incidentBlank.includes('A note is required'), 'incident reports need a note');
+  const incidentListen = await listenFor();
+  const incident = await rideClient.query(`select * from public.report_safety_incident($1, $2)`, [p8Id, 'Driver asked me to sit in the front.']);
+  await sleep(500);
+  assert(incident.rows[0].event_type === 'manual_report' && incident.rows[0].metadata.note.includes('front'), 'an incident report is logged');
+  assert(gotEvent(incidentListen.seen, 'covia.safety.incident', p8Id), 'incidents broadcast covia.safety.incident');
+  await incidentListen.end();
+
+  // Lifecycle: completing the ride finishes monitoring and purges locations.
+  await asUser(user1);
+  await rideClient.query(`select * from public.complete_ride($1)`, [p8Id]);
+  const monEnd = await rideClient.query(`select status, finished_at from public.ride_monitoring where ride_id = $1`, [p8Id]);
+  assert(monEnd.rows[0].status === 'finished' && monEnd.rows[0].finished_at !== null, 'completion finishes monitoring');
+  const locsEnd = await rideClient.query(`select count(*)::int as n from public.live_locations where ride_id = $1`, [p8Id]);
+  assert(locsEnd.rows[0].n === 0, 'live locations are purged when the ride ends');
+  await asUser(user2);
+  const locAfterEnd = await rideClient.query(`select * from public.update_live_location($1, $2)`, [p8Id, JSON.stringify({ lat: 6.5, lng: 3.36 })])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof locAfterEnd === 'string' && locAfterEnd.includes('Live location is only shared during an active ride'), 'sharing stops after completion');
+  await asUser(user1);
+  await rideClient.query(`select * from public.complete_ride($1)`, [p8bId]);
+  const monEnd2 = await rideClient.query(`select status from public.ride_monitoring where ride_id = $1`, [p8bId]);
+  assert(monEnd2.rows[0].status === 'finished', 'completion finishes monitoring on every ride');
+
+  // Retention: stale finished-ride locations are cleaned by the monitor.
+  await rideClient.query('reset role');
+  await rideClient.query(
+    `insert into public.live_locations (ride_id, user_id, location, updated_at)
+     values ($1, $2, '{"lat":6.5,"lng":3.36}', now() - interval '25 hours')`, [p8Id, user2]);
+  await rideClient.query(`select public.run_safety_monitor() as actions`);
+  await rideClient.query('set role authenticated');
+  const locsRetained = await rideClient.query(`select count(*)::int as n from public.live_locations where ride_id = $1`, [p8Id]);
+  assert(locsRetained.rows[0].n === 0, 'stale finished-ride locations are retained only within the window');
+
+  // RLS over the safety tables.
+  await asUser(user4);
+  const seOutsider = await rideClient.query(`select count(*)::int as n from public.safety_events where ride_id = $1`, [p8Id]);
+  assert(seOutsider.rows[0].n === 0, 'RLS hides safety events from outsiders');
+  const rmOutsider = await rideClient.query(`select count(*)::int as n from public.ride_monitoring where ride_id = $1`, [p8Id]);
+  assert(rmOutsider.rows[0].n === 0, 'RLS hides monitoring rows from outsiders');
+  const cfgRead = await rideClient.query(`select count(*)::int as n from public.safety_config`);
+  assert(cfgRead.rows[0].n === 1, 'safety config is readable by all authenticated users');
+  await asUser(user1);
+  const seVisible = await rideClient.query(`select count(*)::int as n from public.safety_events where ride_id = $1`, [p8Id]);
+  assert(seVisible.rows[0].n > 0, 'ride members can read safety events');
+  const rmVisible = await rideClient.query(`select count(*)::int as n from public.ride_monitoring where ride_id = $1`, [p8Id]);
+  assert(rmVisible.rows[0].n === 1, 'ride members can read monitoring state');
+  const seInsert = await rideClient.query(`insert into public.safety_events (ride_id, user_id, event_type) values ($1, $1, 'sos')`, [p8Id])
+    .then(() => null).catch((e) => e.code);
+  assert(seInsert === '42501', 'safety events are append-only via RPCs');
+  const seUpdate = await rideClient.query(`update public.safety_events set severity = 'info' where ride_id = $1`, [p8Id])
+    .then(() => null).catch((e) => e.code);
+  assert(seUpdate === '42501', 'safety events cannot be edited directly');
+  const rmUpdate = await rideClient.query(`update public.ride_monitoring set status = 'suspended' where ride_id = $1`, [p8Id])
+    .then(() => null).catch((e) => e.code);
+  assert(rmUpdate === '42501', 'monitoring rows cannot be edited directly');
+  const outboundDenied = await rideClient.query(`select count(*)::int as n from public.outbound_notifications`)
+    .then(() => null).catch((e) => e.code);
+  assert(outboundDenied === '42501', 'the outbound queue is invisible to clients');
+
+  // Restore the default thresholds.
+  await rideClient.query('reset role');
+  await rideClient.query(`select * from public.update_safety_config(
+    p_route_deviation_meters => 500, p_stop_threshold_seconds => 120,
+    p_safety_check_timeout_seconds => 60, p_never_started_minutes => 15,
+    p_exceeded_duration_minutes => 45, p_notify_participants_on_sos => true,
+    p_sos_repeat_window_seconds => 120, p_live_location_retention_hours => 24)`);
+  await rideClient.query('set role authenticated');
 
   await rideClient.query('reset role');
   await rideClient.end();
