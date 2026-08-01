@@ -658,7 +658,7 @@ begin
          decided_at = now()
    where id = p_appeal_id;
 
-  if p_approve and v_action is not null then
+  if p_approve and v_action.id is not null then
     update public.moderation_actions
        set status = 'lifted',
            revoked_by = auth.uid(),
@@ -900,6 +900,62 @@ begin
 end;
 $$;
 
+-- Rules are configurable at runtime — never hardcoded thresholds.
+create or replace function public.admin_list_moderation_rules(
+  p_page integer default 1,
+  p_page_size integer default 100
+)
+returns table (
+  rule_name text,
+  threshold numeric,
+  action_type text,
+  duration_hours integer,
+  severity smallint,
+  enabled boolean,
+  total_count bigint
+)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_size integer := least(greatest(p_page_size, 1), 200);
+  v_page integer := greatest(p_page, 1);
+begin
+  if not public.is_admin() then
+    raise exception 'Admin access required';
+  end if;
+
+  return query
+    select mr.rule_name, mr.threshold, mr.action_type, mr.duration_hours,
+           mr.severity, mr.enabled,
+           count(*) over ()::bigint
+      from public.moderation_rules mr
+     order by mr.rule_name
+     limit v_size offset (v_page - 1) * v_size;
+end;
+$$;
+
+-- Config is runtime-tunable; clients read the review window to render
+-- "rating closes in X" countdowns without touching the RLS-locked table.
+create or replace function public.get_trust_config()
+returns table (
+  review_window_hours integer
+)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+begin
+  return query
+    select tc.review_window_hours
+      from public.trust_config tc
+     where tc.id = 1;
+end;
+$$;
+
 -- =============================================================
 -- Grants
 -- =============================================================
@@ -914,8 +970,23 @@ revoke all on function
   public.admin_list_appeals, public.admin_decide_appeal,
   public.admin_apply_moderation_action, public.admin_lift_moderation_action,
   public.admin_list_moderation_actions, public.admin_update_moderation_rule,
-  public.admin_list_reliability_events
+  public.admin_list_reliability_events, public.get_trust_config,
+  public.admin_list_moderation_rules
   from public;
+
+grant execute on function public.admin_list_moderation_rules(integer, integer) to authenticated;
+grant execute on function
+  public.admin_list_reports(text, integer, integer),
+  public.admin_review_report(uuid, boolean, text),
+  public.admin_list_appeals(text, integer, integer),
+  public.admin_decide_appeal(uuid, boolean, text),
+  public.admin_apply_moderation_action(uuid, text, text, integer),
+  public.admin_lift_moderation_action(uuid, text),
+  public.admin_list_moderation_actions(uuid, text, integer, integer),
+  public.admin_update_moderation_rule(text, numeric, text, integer, boolean),
+  public.admin_list_reliability_events(uuid, integer, integer),
+  public.admin_get_trust_summary(uuid)
+  to authenticated;
 
 grant execute on function
   public.report_user(uuid, text, text, jsonb),
@@ -926,5 +997,6 @@ grant execute on function
   public.get_my_appeals(),
   public.get_my_moderation_status(),
   public.get_trust_summary(),
-  public.get_public_trust_summary(uuid)
+  public.get_public_trust_summary(uuid),
+  public.get_trust_config()
   to authenticated;

@@ -413,7 +413,6 @@ create policy ratings_select_revealed on public.ratings
   for select using (
     is_revealed
     or rater_user_id = auth.uid()
-    or ratee_user_id = auth.uid()
     or public.is_admin()
   );
 
@@ -452,10 +451,12 @@ create policy reliability_events_select_own on public.reliability_events
     or public.is_admin()
   );
 
--- Config tables are private (read via admin RPCs); no policies.
-alter table public.reliability_config force row level security;
-alter table public.moderation_rules force row level security;
-alter table public.trust_config force row level security;
+-- Config tables are private (read via admin RPCs); clients get no
+-- grants at all, and the migration owner (which owns the security-definer
+-- functions) needs to edit them without FORCE RLS interference.
+alter table public.reliability_config enable row level security;
+alter table public.moderation_rules enable row level security;
+alter table public.trust_config enable row level security;
 
 -- =============================================================
 -- Grants: SELECT per RLS policy above; nothing else for clients.

@@ -387,6 +387,105 @@ $$;
 -- =============================================================
 -- Notification vocabulary extension (Phase 9 types)
 -- =============================================================
+-- Extend the notifications.type CHECK (0017) so trust/moderation
+-- notifications can be stored. Constraint is dropped by name: the
+-- auto-generated name on the `notifications` table is
+-- notifications_type_check.
+alter table public.notifications
+  drop constraint if exists notifications_type_check;
+
+alter table public.notifications
+  add constraint notifications_type_check check (type in (
+    'ride_request_received', 'ride_request_approved', 'ride_request_rejected',
+    'passenger_joined', 'passenger_left', 'passenger_removed',
+    'ride_updated', 'ride_cancelled', 'ride_started', 'ride_completed',
+    'ride_expired',
+    'chat_message', 'chat_image',
+    'verification_submitted', 'verification_approved', 'verification_rejected',
+    'resubmission_requested',
+    'welcome', 'password_changed', 'email_verified',
+    'safety_check', 'emergency_alert', 'marketing',
+    'warning_issued', 'account_restricted', 'appeal_decided', 'report_resolved'
+  ));
+
+-- record_notification() is recreated with the extended whitelist; the
+-- preference-gate chain and duplicate prevention are unchanged. The
+-- moderation types are account-level and always deliver.
+create or replace function public.record_notification(
+  p_recipient_user_id uuid,
+  p_type text,
+  p_title text,
+  p_message text,
+  p_data jsonb default '{}'::jsonb,
+  p_actor_user_id uuid default null,
+  p_expires_at timestamptz default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_enabled boolean;
+begin
+  if p_recipient_user_id is null then
+    raise exception 'A notification recipient is required';
+  end if;
+
+  if p_type not in (
+    'ride_request_received', 'ride_request_approved', 'ride_request_rejected',
+    'passenger_joined', 'passenger_left', 'passenger_removed',
+    'ride_updated', 'ride_cancelled', 'ride_started', 'ride_completed',
+    'ride_expired',
+    'chat_message', 'chat_image',
+    'verification_submitted', 'verification_approved', 'verification_rejected',
+    'resubmission_requested',
+    'welcome', 'password_changed', 'email_verified',
+    'safety_check', 'emergency_alert', 'marketing',
+    'warning_issued', 'account_restricted', 'appeal_decided', 'report_resolved'
+  ) then
+    raise exception 'Unknown notification type: %', p_type;
+  end if;
+
+  -- Preference gate by category (account notifications always deliver).
+  if p_type like 'ride_%' then
+    select ride_enabled into v_enabled
+      from public.notification_preferences where user_id = p_recipient_user_id;
+    v_enabled := coalesce(v_enabled, true);
+  elsif p_type in ('chat_message', 'chat_image') then
+    select chat_enabled into v_enabled
+      from public.notification_preferences where user_id = p_recipient_user_id;
+    v_enabled := coalesce(v_enabled, true);
+  elsif p_type in ('verification_submitted', 'verification_approved', 'verification_rejected', 'resubmission_requested') then
+    select verification_enabled into v_enabled
+      from public.notification_preferences where user_id = p_recipient_user_id;
+    v_enabled := coalesce(v_enabled, true);
+  elsif p_type in ('safety_check', 'emergency_alert') then
+    select safety_enabled into v_enabled
+      from public.notification_preferences where user_id = p_recipient_user_id;
+    v_enabled := coalesce(v_enabled, true);
+  elsif p_type = 'marketing' then
+    select marketing_enabled into v_enabled
+      from public.notification_preferences where user_id = p_recipient_user_id;
+    v_enabled := coalesce(v_enabled, false);
+  else
+    v_enabled := true;
+  end if;
+
+  if not v_enabled then
+    return;
+  end if;
+
+  insert into public.notifications (
+    recipient_user_id, actor_user_id, type, title, message, data, expires_at
+  )
+  values (
+    p_recipient_user_id, p_actor_user_id, p_type, p_title, p_message,
+    p_data, p_expires_at
+  );
+end;
+$$;
+
 create or replace function public.is_valid_notification_type(p_type text)
 returns boolean
 language sql
@@ -398,6 +497,7 @@ as $$
     'passenger_joined', 'passenger_left', 'passenger_removed',
     'ride_updated', 'ride_cancelled', 'ride_started', 'ride_completed',
     'ride_expired',
+    'chat_message', 'chat_image',
     'verification_submitted', 'verification_approved', 'verification_rejected',
     'resubmission_requested',
     'welcome', 'password_changed', 'email_verified',

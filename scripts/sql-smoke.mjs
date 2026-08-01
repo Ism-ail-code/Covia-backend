@@ -99,6 +99,19 @@ async function main() {
     console.log(`Applied ${file}`);
   }
 
+  // Phase 9 adds automatic moderation. Phases 1-8 reuse a handful of
+  // users who legitimately cancel/leave many rides, so the behavioural
+  // rules (reliability + cancellation thresholds) are disabled for the
+  // rest of the suite; the Phase 9 section re-enables and reconfigures
+  // them through the admin RPC to prove the engine works.
+  await client.query(`
+    update public.moderation_rules
+       set enabled = false
+     where rule_name in ('reliability_below_warning', 'reliability_below_restrict',
+                         'reliability_critical_suspend', 'cancellations_warning',
+                         'cancellations_restrict');
+  `);
+
   const [user1, user2] = [crypto.randomUUID(), crypto.randomUUID()];
 
   // â”€â”€ Profile auto-creation on signup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2207,6 +2220,421 @@ async function main() {
     p_exceeded_duration_minutes => 45, p_notify_participants_on_sos => true,
     p_sos_repeat_window_seconds => 120, p_live_location_retention_hours => 24)`);
   await rideClient.query('set role authenticated');
+
+  // ── Phase 9: trust (ratings, reviews, reliability, reports, appeals, moderation) ──
+  await rideClient.query('reset role');
+  const [user5, user6, user7] = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+  await rideClient.query(
+    `insert into auth.users (id, email, raw_user_meta_data) values
+       ($1, 'dan@example.com', '{"full_name":"Dan Example"}'),
+       ($2, 'erin@example.com', '{"full_name":"Erin Example"}'),
+       ($3, 'frank@example.com', '{"full_name":"Frank Example"}')`,
+    [user5, user6, user7],
+  );
+  // Fresh slate for deterministic scores: earlier phases reused the
+  // shared users, so wipe the trust tables entirely.
+  await rideClient.query(`
+    delete from public.reviews;
+    delete from public.ratings;
+    delete from public.reports;
+    delete from public.appeals;
+    delete from public.moderation_actions;
+    delete from public.reliability_events;
+    update public.profiles set reliability_score = 90, rating = 5.0;
+  `);
+  await rideClient.query('set role authenticated');
+  // Verify dan and erin (bob the admin approves).
+  await asUser(user5);
+  const subDan = await rideClient.query(
+    `select * from public.submit_verification('government_id', $1, $2, null, null, null, 'national_id')`,
+    [`verification/${user5}/front.png`, `verification/${user5}/back.png`]);
+  await asUser(user6);
+  const subErin = await rideClient.query(
+    `select * from public.submit_verification('government_id', $1, $2, null, null, null, 'national_id')`,
+    [`verification/${user6}/front.png`, `verification/${user6}/back.png`]);
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_review_verification($1, 'approve')`, [subDan.rows[0].id]);
+  await rideClient.query(`select * from public.admin_review_verification($1, 'approve')`, [subErin.rows[0].id]);
+  await asUser(user7);
+  const subFrank = await rideClient.query(
+    `select * from public.submit_verification('government_id', $1, $2, null, null, null, 'national_id')`,
+    [`verification/${user7}/front.png`, `verification/${user7}/back.png`]);
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_review_verification($1, 'approve')`, [subFrank.rows[0].id]);
+  const danVer = await rideClient.query(`select public.is_user_verified() as v`);
+  assert(danVer.rows[0].v === true, 'dan is verified for the trust tests');
+
+  // Schema: every trust table exists with the expected surface.
+  const trustCols = async (table) => {
+    const r = await rideClient.query(
+      `select column_name from information_schema.columns
+       where table_schema = 'public' and table_name = $1`, [table]);
+    return r.rows.map((c) => c.column_name);
+  };
+  const ratingCols = await trustCols('ratings');
+  for (const col of ['ride_id', 'rater_user_id', 'ratee_user_id', 'role_of_rater', 'overall_rating', 'punctuality', 'communication', 'respectfulness', 'reliability', 'is_revealed', 'revealed_at']) {
+    assert(ratingCols.includes(col), `ratings has ${col}`);
+  }
+  const reviewCols = await trustCols('reviews');
+  for (const col of ['rating_id', 'content', 'profanity_flag', 'is_revealed']) {
+    assert(reviewCols.includes(col), `reviews has ${col}`);
+  }
+  const reportCols = await trustCols('reports');
+  for (const col of ['target_type', 'target_user_id', 'target_ride_id', 'reason', 'details', 'evidence_refs', 'status', 'is_confirmed']) {
+    assert(reportCols.includes(col), `reports has ${col}`);
+  }
+  const appealCols = await trustCols('appeals');
+  for (const col of ['user_id', 'moderation_action_id', 'reason', 'status']) {
+    assert(appealCols.includes(col), `appeals has ${col}`);
+  }
+  const actionCols = await trustCols('moderation_actions');
+  for (const col of ['action_type', 'severity', 'status', 'source', 'ends_at']) {
+    assert(actionCols.includes(col), `moderation_actions has ${col}`);
+  }
+  const evtCols = await trustCols('reliability_events');
+  for (const col of ['user_id', 'event_type', 'weight', 'ride_id']) {
+    assert(evtCols.includes(col), `reliability_events has ${col}`);
+  }
+  await asUser(user2);
+  const rules = await rideClient.query(`select count(*)::int as n from public.admin_list_moderation_rules(1, 100)`);
+  assert(rules.rows[0].n === 11, 'moderation rules seeded (11 configurable thresholds)');
+  const tcfg = await rideClient.query(`select review_window_hours from public.get_trust_config()`);
+  assert(Number(tcfg.rows[0].review_window_hours) === 72, 'default review window is 72 hours');
+  const grants9 = await rideClient.query(
+    `select
+       has_function_privilege('authenticated', 'public.report_user(uuid,text,text,jsonb)', 'execute') as auth_report,
+       has_function_privilege('anon', 'public.report_user(uuid,text,text,jsonb)', 'execute') as anon_report,
+       has_function_privilege('authenticated', 'public.rate_ride(uuid,uuid,integer,integer,integer,integer,integer,text)', 'execute') as auth_rate,
+       has_function_privilege('public', 'public.reveal_pair_reviews(uuid,uuid,uuid)', 'execute') as pub_reveal`);
+  assert(grants9.rows[0].auth_report === true, 'authenticated can report');
+  assert(grants9.rows[0].anon_report === false, 'anon cannot report');
+  assert(grants9.rows[0].auth_rate === true, 'authenticated can rate');
+  assert(grants9.rows[0].pub_reveal === false, 'reveal helpers are internal');
+
+  // Complete ride A: dan hosts, erin rides.
+  await asUser(user5);
+  const rideA = await createRide('Ikeja', 'VI', 'Jibowu', 30, 2, 'fixed', 1500);
+  await publishRide(rideA.id);
+  await asUser(user6);
+  await rideClient.query(`select * from public.request_to_join($1)`, [rideA.id]);
+  await asUser(user5);
+  const req9A = await rideClient.query(`select * from public.get_ride_requests($1)`, [rideA.id]);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true)`, [req9A.rows[0].id]);
+  await rideClient.query(`select * from public.start_ride($1)`, [rideA.id]);
+  await rideClient.query(`select * from public.complete_ride($1)`, [rideA.id]);
+
+  // Rating gates: participant-only, post-completion, one per pair.
+  await asUser(user7);
+  const outsiderRate = await rideClient.query(`select * from public.rate_ride($1, null, 4)`, [rideA.id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof outsiderRate === 'string' && outsiderRate.includes('only rate rides you were on'), 'non-participants cannot rate');
+  await asUser(user6);
+  const badScale = await rideClient.query(`select * from public.rate_ride($1, $2, 6)`, [rideA.id, user5])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badScale === 'string' && badScale.includes('between 1 and 5'), 'out-of-range stars rejected');
+  const blankReview = await rideClient.query(`select * from public.rate_ride($1, $2, 4, null, null, null, null, '   ')`, [rideA.id, user5])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof blankReview === 'string' && blankReview.includes('must contain some text'), 'blank reviews rejected');
+  const longReview = await rideClient.query(`select * from public.rate_ride($1, $2, 4, null, null, null, null, $3)`, [rideA.id, user5, 'x'.repeat(1001)])
+    .catch((e) => e.message ?? '');
+  assert(typeof longReview === 'string' && longReview.includes('1000 characters'), 'overlong reviews rejected');
+
+  // Double-blind: erin rates dan first — nobody can see it yet.
+  await asUser(user6);
+  const erinRates = await rideClient.query(`select * from public.rate_ride($1, $2, 3, null, null, null, null, 'Not punctual')`, [rideA.id, user5]);
+  assert(erinRates.rows[0].is_revealed === false, 'first rating is hidden (double-blind)');
+  await asUser(user5);
+  const hiddenFromTarget = await rideClient.query(`select count(*)::int as n from public.ratings where ratee_user_id = $1`, [user5]);
+  assert(hiddenFromTarget.rows[0].n === 0, 'RLS hides unrevealed ratings from the target');
+  await asUser(user4);
+  const hiddenFeed = await rideClient.query(`select * from public.get_user_ratings($1)`, [user5]);
+  assert(hiddenFeed.rowCount === 0, 'unrevealed ratings are absent from the public feed');
+  await asUser(user6);
+  const statusPre = await rideClient.query(`select * from public.get_ride_rating_status($1)`, [rideA.id]);
+  assert(statusPre.rowCount === 1 && statusPre.rows[0].is_revealed === false
+    && statusPre.rows[0].reciprocal_submitted === false && statusPre.rows[0].window_expired === false,
+    'status shows an unrevealed rating with no reveal path yet');
+
+  // The reciprocal rating reveals both sides instantly.
+  await asUser(user5);
+  const danRates = await rideClient.query(`select * from public.rate_ride($1, $2, 4, 5, 4, 5, 4, 'Great company')`, [rideA.id, user6]);
+  const danNowRevealed = await rideClient.query(`select is_revealed from public.ratings where id = $1`, [danRates.rows[0].id]);
+  assert(danNowRevealed.rows[0].is_revealed === true, 'rating reveals when the counterpart rates');
+  await asUser(user6);
+  const erinNowRevealed = await rideClient.query(`select is_revealed from public.ratings where id = $1`, [erinRates.rows[0].id]);
+  assert(erinNowRevealed.rows[0].is_revealed === true, 'reciprocal reveal covers both sides');
+  const dupRate = await rideClient.query(`select * from public.rate_ride($1, $2, 5)`, [rideA.id, user5])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof dupRate === 'string' && dupRate.includes('already rated'), 'duplicate rating rejected');
+  await asUser(user4);
+  const revealedFeed = await rideClient.query(`select * from public.get_user_ratings($1)`, [user5]);
+  assert(revealedFeed.rowCount === 1 && Number(revealedFeed.rows[0].overall_rating) === 3 && revealedFeed.rows[0].comment === 'Not punctual', 'revealed ratings appear with reviews');
+  await rideClient.query('reset role');
+  const profileRating = await rideClient.query(`select rating from public.profiles where id = $1`, [user5]);
+  await rideClient.query('set role authenticated');
+  assert(Number(profileRating.rows[0].rating) === 3, 'profiles.rating syncs to the revealed average');
+
+  // Revealed ratings are immutable; hidden ones can be edited/withdrawn.
+  await asUser(user5);
+  const editRevealed = await rideClient.query(`select * from public.update_rating($1, 2)`, [danRates.rows[0].id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof editRevealed === 'string' && editRevealed.includes('no longer be changed'), 'revealed ratings are immutable');
+
+  // Window expiry: ride B, dan rates erin, only the window reveals it.
+  await asUser(user5);
+  const rideB = await createRide('Ikeja', 'VI', 'Jibowu', 60, 2, 'fixed', 1500);
+  await publishRide(rideB.id);
+  await asUser(user6);
+  await rideClient.query(`select * from public.request_to_join($1)`, [rideB.id]);
+  await asUser(user5);
+  const req9B = await rideClient.query(`select * from public.get_ride_requests($1)`, [rideB.id]);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true)`, [req9B.rows[0].id]);
+  await rideClient.query(`select * from public.start_ride($1)`, [rideB.id]);
+  await rideClient.query(`select * from public.complete_ride($1)`, [rideB.id]);
+  const bRate = await rideClient.query(`select * from public.rate_ride($1, $2, 5, null, null, null, null, 'Smooth ride')`, [rideB.id, user6]);
+  assert(bRate.rows[0].is_revealed === false, 'unilateral rating stays hidden after completion');
+  await rideClient.query('reset role');
+  await rideClient.query(`update public.ratings set created_at = now() - interval '4 days' where id = $1`, [bRate.rows[0].id]);
+  const expired = await rideClient.query(`select public.reveal_expired_reviews() as n`);
+  await rideClient.query('set role authenticated');
+  assert(Number(expired.rows[0].n) >= 1, 'reveal_expired_reviews flips expired ratings');
+  await asUser(user5);
+  const statusPost = await rideClient.query(`select * from public.get_ride_rating_status($1)`, [rideB.id]);
+  assert(statusPost.rowCount === 1 && statusPost.rows[0].is_revealed === true
+    && statusPost.rows[0].reciprocal_submitted === false && statusPost.rows[0].window_expired === true,
+    'window expiry reveals the rating without the counterpart');
+
+  // Reliability: completed rides +3, host cancel -8, passenger leave -5.
+  await asUser(user5);
+  const danScore = await rideClient.query(`select reliability_score from public.profiles where id = $1`, [user5]);
+  assert(danScore.rows[0].reliability_score === 96, 'host completions earn +3 reliability each');
+  await asUser(user6);
+  const erinScore = await rideClient.query(`select reliability_score from public.profiles where id = $1`, [user6]);
+  assert(erinScore.rows[0].reliability_score === 96, 'passenger completions earn +3 reliability each');
+  // Ride C: erin joins, tries rating early, then leaves; dan cancels.
+  await asUser(user5);
+  const rideC = await createRide('Ikeja', 'VI', 'Jibowu', 90, 2, 'fixed', 1500);
+  await publishRide(rideC.id);
+  await asUser(user6);
+  await rideClient.query(`select * from public.request_to_join($1)`, [rideC.id]);
+  await asUser(user5);
+  const req9C = await rideClient.query(`select * from public.get_ride_requests($1)`, [rideC.id]);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true)`, [req9C.rows[0].id]);
+  await asUser(user6);
+  const earlyRate = await rideClient.query(`select * from public.rate_ride($1, $2, 5)`, [rideC.id, user5])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof earlyRate === 'string' && earlyRate.includes('after they are completed'), 'rating before completion rejected');
+  await rideClient.query(`select * from public.leave_ride($1)`, [rideC.id]);
+  await asUser(user5);
+  await rideClient.query(`select * from public.cancel_ride($1)`, [rideC.id]);
+  await asUser(user6);
+  const leftRate = await rideClient.query(`select * from public.rate_ride($1, $2, 5)`, [rideC.id, user5])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof leftRate === 'string' && leftRate.includes('stayed on the ride'), 'riders who left cannot rate');
+  await asUser(user6);
+  const erinAfter = await rideClient.query(`select reliability_score from public.profiles where id = $1`, [user6]);
+  assert(erinAfter.rows[0].reliability_score === 91, 'leaving a ride costs -5 reliability');
+  await asUser(user5);
+  const danAfter = await rideClient.query(`select reliability_score from public.profiles where id = $1`, [user5]);
+  assert(danAfter.rows[0].reliability_score === 88, 'host cancellation costs -8 reliability');
+  await rideClient.query('reset role');
+  const evtWeights = await rideClient.query(
+    `select event_type, weight from public.reliability_events where user_id = $1 order by created_at`, [user5]);
+  await rideClient.query('set role authenticated');
+  assert(evtWeights.rows.map((r) => r.event_type).join(',') === 'ride_completed,ride_completed,ride_cancelled_by_host', 'reliability events follow the ride timeline');
+  assert(Number(evtWeights.rows[0].weight) === 3 && Number(evtWeights.rows[2].weight) === -8, 'event weights come from reliability_config');
+
+  // Reports: validation, confidentiality, duplicate prevention, review.
+  await asUser(user6);
+  const selfReport = await rideClient.query(`select * from public.report_user($1, 'harassment')`, [user6])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof selfReport === 'string' && selfReport.includes('cannot report yourself'), 'self-reporting rejected');
+  const badReason = await rideClient.query(`select * from public.report_user($1, 'banana')`, [user7])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badReason === 'string' && badReason.includes('not recognised'), 'unknown report reasons rejected');
+  const badRefs = await rideClient.query(`select * from public.report_user($1, 'harassment', 'x', '"not-an-array"')`, [user7])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badRefs === 'string' && badRefs.includes('must be a list'), 'evidence refs must be a list');
+  const report1 = await rideClient.query(`select * from public.report_user($1, 'harassment', 'Kept messaging me after the ride.')`, [user7]);
+  assert(report1.rows[0].status === 'pending' && report1.rows[0].target_user_id === user7, 'user report created');
+  const dupReport = await rideClient.query(`select * from public.report_user($1, 'harassment')`, [user7])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof dupReport === 'string' && dupReport.includes('already reported'), 'duplicate pending reports blocked');
+  const rideReport = await rideClient.query(`select * from public.report_ride($1, 'dangerous_behavior', 'Erratic driving.')`, [rideA.id]);
+  assert(rideReport.rows[0].target_ride_id === rideA.id, 'ride report created');
+  const ghostRide = await rideClient.query(`select * from public.report_ride('00000000-0000-0000-0000-000000000000', 'fraud')`)
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof ghostRide === 'string' && ghostRide.includes('does not exist'), 'reporting a missing ride rejected');
+  await asUser(user4);
+  const confTarget = await rideClient.query(`select count(*)::int as n from public.reports`);
+  assert(confTarget.rows[0].n === 0, 'reports are confidential (targets cannot see them)');
+  await asUser(user6);
+  const myReports = await rideClient.query(`select * from public.get_my_reports(1, 10)`);
+  assert(Number(myReports.rows[0].total_count) === 2, 'reporter sees their own reports');
+  // A dismissed report frees the duplicate slot.
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_review_report($1, false, 'No evidence')`, [report1.rows[0].id]);
+  await asUser(user6);
+  const report2 = await rideClient.query(`select * from public.report_user($1, 'harassment', 'Still at it.')`, [user7]);
+  assert(report2.rows[0].id !== report1.rows[0].id, 'a dismissed report allows a fresh report');
+  const dismissed = await rideClient.query(`select status, is_confirmed from public.reports where id = $1`, [report1.rows[0].id]);
+  assert(dismissed.rows[0].status === 'dismissed' && dismissed.rows[0].is_confirmed === false, 'dismissal recorded');
+
+  // Graduated enforcement: warnings first, then restriction, then suspension.
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_update_moderation_rule(p_rule_name => 'cancellations_warning', p_threshold => 1, p_enabled => true)`);
+  await rideClient.query(`select * from public.admin_update_moderation_rule(p_rule_name => 'cancellations_restrict', p_threshold => 2, p_enabled => true)`);
+  await asUser(user4);
+  const nonAdminRules = await rideClient.query(`select * from public.admin_update_moderation_rule('cancellations_warning', 1)`)
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof nonAdminRules === 'string' && nonAdminRules.includes('Admin access required'), 'rule changes are admin-only');
+  // Frank hosts two rides and cancels both.
+  await asUser(user7);
+  const f1 = await createRide('Ikeja', 'VI', 'Jibowu', 130, 2, 'fixed', 1500);
+  await publishRide(f1.id);
+  const f2 = await createRide('Ikeja', 'VI', 'Jibowu', 140, 2, 'fixed', 1500);
+  await publishRide(f2.id);
+  await rideClient.query(`select * from public.cancel_ride($1)`, [f1.id]);
+  const frankWarn = await rideClient.query(`select id, action_type, source, severity from public.moderation_actions where user_id = $1 order by created_at desc limit 1`, [user7]);
+  assert(frankWarn.rows[0].action_type === 'warning' && frankWarn.rows[0].source === 'automatic' && Number(frankWarn.rows[0].severity) === 1, 'first offence is a warning');
+  const warnNotif = await cnt(user7, 'warning_issued');
+  assert(warnNotif === 1, 'the user is notified of the warning');
+  await rideClient.query(`select * from public.cancel_ride($1)`, [f2.id]);
+  const frankRestrict = await rideClient.query(`select action_type, ends_at from public.moderation_actions where user_id = $1 order by created_at desc limit 1`, [user7]);
+  assert(frankRestrict.rows[0].action_type === 'temporary_restriction' && frankRestrict.rows[0].ends_at !== null, 'repeated offence escalates to a temporary restriction');
+  // Gates: cannot create or join rides while restricted.
+  const blockedCreate = await rideClient.query(`select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 2, 'fixed', 1000, null, null, false, false, 'bus_stop')`,
+    [locJson('Ikeja'), locJson('VI'), locJson('Jibowu'), dep(200)])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof blockedCreate === 'string' && blockedCreate.includes('restricted from creating rides'), 'restricted users cannot create rides');
+  await asUser(user5);
+  const rideF = await createRide('Ikeja', 'VI', 'Jibowu', 210, 2, 'fixed', 1500);
+  await publishRide(rideF.id);
+  await asUser(user7);
+  const blockedJoin = await rideClient.query(`select * from public.request_to_join($1)`, [rideF.id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof blockedJoin === 'string' && blockedJoin.includes('restricted from joining rides'), 'restricted users cannot join rides');
+  const frankStatus = await rideClient.query(`select public.get_my_moderation_status() as s`);
+  assert(frankStatus.rows[0].s.can_create_rides === false && frankStatus.rows[0].s.can_join_rides === false && frankStatus.rows[0].s.is_suspended === false, 'moderation status reflects the restriction');
+  assert(Number(frankStatus.rows[0].s.restrictions.length) === 2, 'moderation status lists active actions');
+  // A confirmed report escalates to suspension.
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_update_moderation_rule(p_rule_name => 'confirmed_reports_suspend', p_threshold => 1, p_enabled => true)`);
+  await asUser(user6);
+  const report3 = await rideClient.query(`select * from public.report_user($1, 'dangerous_behavior', 'Reckless on the road.')`, [user7]);
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_review_report($1, true, 'Confirmed')`, [report3.rows[0].id]);
+  await asUser(user7);
+  const frankSusp = await rideClient.query(`select action_type from public.moderation_actions where user_id = $1 order by created_at desc limit 1`, [user7]);
+  assert(frankSusp.rows[0].action_type === 'suspension', 'confirmed reports escalate to suspension');
+  const suspStatus = await rideClient.query(`select public.get_my_moderation_status() as s`);
+  assert(suspStatus.rows[0].s.is_suspended === true, 'status reports the suspension');
+  const suspNotif = await cnt(user7, 'account_restricted');
+  assert(suspNotif === 2, 'restrictions notify the user');
+  const suspRate = await rideClient.query(`select * from public.rate_ride($1, $2, 5)`, [rideB.id, user6])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof suspRate === 'string' && suspRate.includes('suspended'), 'suspended users cannot rate');
+
+  // Appeals: one per action, editable while pending, admin decides.
+  await asUser(user7);
+  const tempAction = await rideClient.query(`select id from public.moderation_actions where user_id = $1 and action_type = 'temporary_restriction' order by created_at desc limit 1`, [user7]);
+  const appeal1 = await rideClient.query(`select * from public.submit_appeal($1, 'I cancelled because of a family emergency.')`, [tempAction.rows[0].id]);
+  assert(appeal1.rows[0].status === 'pending', 'appeal submitted for the restriction');
+  const dupAppeal = await rideClient.query(`select * from public.submit_appeal($1, 'Again')`, [tempAction.rows[0].id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof dupAppeal === 'string' && dupAppeal.includes('already have a pending appeal'), 'one pending appeal per action');
+  await asUser(user6);
+  const editOthers = await rideClient.query(`select * from public.update_appeal($1, 'hacked')`, [appeal1.rows[0].id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof editOthers === 'string' && editOthers.includes('not found or no longer editable'), 'only the owner edits an appeal');
+  await asUser(user7);
+  const appealEdited = await rideClient.query(`select * from public.update_appeal($1, 'Cancelled due to a family emergency.')`, [appeal1.rows[0].id]);
+  assert(appealEdited.rows[0].reason.includes('family emergency'), 'pending appeals are editable by the owner');
+  const warnAppeal = await rideClient.query(`select * from public.submit_appeal($1, 'why')`, [frankWarn.rows[0].id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof warnAppeal === 'string' && warnAppeal.includes('Warnings cannot be appealed'), 'warnings are not appealable');
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_decide_appeal($1, false, 'No new information')`, [appeal1.rows[0].id]);
+  await asUser(user7);
+  const appealRejected = await rideClient.query(`select status from public.appeals where id = $1`, [appeal1.rows[0].id]);
+  assert(appealRejected.rows[0].status === 'rejected', 'rejected appeal keeps the restriction');
+  const appeal2 = await rideClient.query(`select * from public.submit_appeal($1, 'Verified by my family.')`, [tempAction.rows[0].id]);
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_decide_appeal($1, true, 'Approved')`, [appeal2.rows[0].id]);
+  await rideClient.query('reset role');
+  const lifted = await rideClient.query(`select status from public.moderation_actions where id = $1`, [tempAction.rows[0].id]);
+  await rideClient.query('set role authenticated');
+  assert(lifted.rows[0].status === 'lifted', 'approved appeal lifts the action');
+  const appealNotif = await cnt(user7, 'appeal_decided');
+  assert(appealNotif === 2, 'appeal decisions notify the user');
+
+  // Manual moderation (graduated step 3: human review) + safety valves.
+  await asUser(user5);
+  const manual = await rideClient.query(`select * from public.admin_apply_moderation_action($1, 'warning', 'Be more careful')`, [user7])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof manual === 'string' && manual.includes('Admin access required'), 'manual actions are admin-only');
+  await asUser(user2);
+  const manualWarn = await rideClient.query(`select * from public.admin_apply_moderation_action($1, 'warning', 'Friendly nudge')`, [user5]);
+  assert(manualWarn.rows[0].action_type === 'warning' && Number(manualWarn.rows[0].severity) === 1, 'manual warning applied (severity 1)');
+  const badManual = await rideClient.query(`select * from public.admin_apply_moderation_action($1, 'ban', 'x')`, [user5])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badManual === 'string' && badManual.includes('Unknown moderation action'), 'unknown manual actions rejected');
+  await asUser(user5);
+  const warnAppeal2 = await rideClient.query(`select * from public.submit_appeal($1, 'sorry')`, [manualWarn.rows[0].id])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof warnAppeal2 === 'string' && warnAppeal2.includes('Warnings cannot be appealed'), 'manual warnings are not appealable either');
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_lift_moderation_action($1, 'Test over')`, [manualWarn.rows[0].id]);
+  await rideClient.query('reset role');
+  const liftedManual = await rideClient.query(`select status from public.moderation_actions where id = $1`, [manualWarn.rows[0].id]);
+  await rideClient.query('set role authenticated');
+  assert(liftedManual.rows[0].status === 'lifted', 'admins can lift manual actions');
+
+  // Trust metrics: own summary, public summary, admin variant.
+  await asUser(user6);
+  const trust = await rideClient.query(`select public.get_trust_summary() as s`);
+  const ts = trust.rows[0].s;
+  assert(Number(ts.average_rating) === 4.5 && Number(ts.rating_count) === 2, 'trust summary averages revealed ratings');
+  assert(Number(ts.reliability_score) === 91 && Number(ts.completed_rides) === 2 && Number(ts.cancelled_rides) === 0, 'trust summary carries ride metrics');
+  assert(ts.is_government_id_verified === true, 'trust summary carries verification badges');
+  assert(Number(ts.reports_received_total) === 0 && Number(ts.account_age_days) >= 0, 'trust summary carries report + account age');
+  assert(ts.restrictions === '[]' || JSON.stringify(ts.restrictions) === '[]', 'clean users have no restrictions');
+  await asUser(user4);
+  const pubTrust = await rideClient.query(`select public.get_public_trust_summary($1) as s`, [user6]);
+  assert(Number(pubTrust.rows[0].s.average_rating) === 4.5 && pubTrust.rows[0].s.reports_received_total === undefined, 'public summary reveals only public metrics');
+  const adminBlock = await rideClient.query(`select * from public.admin_get_trust_summary($1)`, [user6])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof adminBlock === 'string' && adminBlock.includes('Admin access required'), 'admin trust summary is admin-only');
+  await asUser(user2);
+  const adminTrust = await rideClient.query(`select public.admin_get_trust_summary($1) as s`, [user6]);
+  assert(Number(adminTrust.rows[0].s.average_rating) === 4.5, 'admins read any user summary');
+  const adminList = await rideClient.query(`select * from public.admin_list_reports('pending')`);
+  assert(Number(adminList.rows[0].total_count) === 2, 'admin report queue lists pending reports');
+  const adminAppeals = await rideClient.query(`select * from public.admin_list_appeals(null)`);
+  assert(Number(adminAppeals.rows[0].total_count) === 2, 'admin appeal queue lists all appeals');
+  const adminActions = await rideClient.query(`select * from public.admin_list_moderation_actions($1, 'active')`, [user7]);
+  assert(Number(adminActions.rows[0].total_count) === 2, 'admin action history lists active actions');
+
+  // RLS over the trust tables (writes and reads).
+  await asUser(user4);
+  const appealsHidden = await rideClient.query(`select count(*)::int as n from public.appeals`);
+  assert(appealsHidden.rows[0].n === 0, 'appeals are invisible to other users');
+  const actionsHidden = await rideClient.query(`select count(*)::int as n from public.moderation_actions`);
+  assert(actionsHidden.rows[0].n === 0, 'moderation actions are invisible to other users');
+  const evtsHidden = await rideClient.query(`select count(*)::int as n from public.reliability_events`);
+  assert(evtsHidden.rows[0].n === 0, 'reliability events are invisible to other users');
+  const directRate = await rideClient.query(`insert into public.ratings (ride_id, rater_user_id, ratee_user_id, role_of_rater, overall_rating) values ($1, $1, $2, 'Host', 5)`, [rideA.id, user5])
+    .then(() => null).catch((e) => e.code);
+  assert(directRate === '42501', 'ratings are RPC-only');
+  const directReport = await rideClient.query(`insert into public.reports (reporter_user_id, target_type, reason) values ($1, 'user', 'fraud')`, [user4])
+    .then(() => null).catch((e) => e.code);
+  assert(directReport === '42501', 'reports are RPC-only');
+  const directReportUpdate = await rideClient.query(`update public.reports set status = 'resolved'`)
+    .then(() => null).catch((e) => e.code);
+  assert(directReportUpdate === '42501', 'report status is moderator-only');
+  await asUser(user6);
+  const evtRead = await rideClient.query(`select count(*)::int as n from public.reliability_events where user_id = $1`, [user6]);
+  assert(evtRead.rows[0].n === 3, 'users read their own reliability events');
 
   await rideClient.query('reset role');
   await rideClient.end();

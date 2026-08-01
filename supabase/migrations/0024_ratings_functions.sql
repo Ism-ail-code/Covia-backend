@@ -129,7 +129,7 @@ as $$
          end,
          rp.role
     from public.ride_participants rp
-    join public.rides r on r.id = rp.ride_id and r.status = 'completed'
+    join public.rides r on r.id = rp.ride_id and r.ride_status = 'completed'
     left join public.ride_participants pass
       on pass.ride_id = rp.ride_id
      and pass.role = 'Passenger'
@@ -149,11 +149,11 @@ $$;
 create or replace function public.rate_ride(
   p_ride_id uuid,
   p_ratee_user_id uuid default null,
-  p_overall_rating smallint default null,
-  p_punctuality smallint default null,
-  p_communication smallint default null,
-  p_respectfulness smallint default null,
-  p_reliability smallint default null,
+  p_overall_rating integer default null,
+  p_punctuality integer default null,
+  p_communication integer default null,
+  p_respectfulness integer default null,
+  p_reliability integer default null,
   p_comment text default null
 )
 returns public.ratings
@@ -172,6 +172,15 @@ begin
     raise exception 'You must be signed in to rate a ride';
   end if;
 
+  if exists (
+    select 1 from public.moderation_actions
+     where user_id = v_rater
+       and status = 'active'
+       and action_type = 'suspension'
+  ) then
+    raise exception 'Your account is suspended; you cannot rate rides right now';
+  end if;
+
   if p_overall_rating is null or p_overall_rating not between 1 and 5 then
     raise exception 'Overall rating must be between 1 and 5';
   end if;
@@ -182,6 +191,12 @@ begin
     raise exception 'Reviews are limited to 1000 characters';
   end if;
 
+  select count(*) into v_targets
+    from public.ride_rateable_targets(p_ride_id, v_rater);
+  if v_targets > 1 and p_ratee_user_id is null then
+    raise exception 'Choose which passenger you are rating';
+  end if;
+
   select target_user_id, my_role
     into v_ratee, v_role
     from public.ride_rateable_targets(p_ride_id, v_rater)
@@ -189,18 +204,16 @@ begin
    limit 1;
 
   if not found then
-    select count(*) into v_targets
-      from public.ride_rateable_targets(p_ride_id, v_rater);
     if v_targets = 0 then
+      if exists (
+        select 1 from public.rides
+         where id = p_ride_id and ride_status = 'completed'
+      ) then
+        raise exception 'You can only rate rides you were on';
+      end if;
       raise exception 'Rides can only be rated after they are completed and only by riders who stayed on the ride';
     end if;
     raise exception 'You can only rate someone who was on the ride with you';
-  end if;
-
-  if p_ratee_user_id is null and exists (
-    select 1 from public.ride_rateable_targets(p_ride_id, v_rater)
-  ) and (select count(*) from public.ride_rateable_targets(p_ride_id, v_rater)) > 1 then
-    raise exception 'Choose which passenger you are rating';
   end if;
 
   insert into public.ratings (
@@ -217,8 +230,8 @@ begin
   end if;
 
   if p_comment is not null then
-    insert into public.reviews (rating_id)
-    values (v_rating.id);
+    insert into public.reviews (rating_id, content)
+    values (v_rating.id, p_comment);
   end if;
 
   return v_rating;
@@ -230,11 +243,11 @@ $$;
 -- =============================================================
 create or replace function public.update_rating(
   p_rating_id uuid,
-  p_overall_rating smallint default null,
-  p_punctuality smallint default null,
-  p_communication smallint default null,
-  p_respectfulness smallint default null,
-  p_reliability smallint default null,
+  p_overall_rating integer default null,
+  p_punctuality integer default null,
+  p_communication integer default null,
+  p_respectfulness integer default null,
+  p_reliability integer default null,
   p_comment text default null
 )
 returns public.ratings
@@ -481,8 +494,8 @@ revoke all on function
   from public;
 
 grant execute on function
-  public.rate_ride(uuid, uuid, smallint, smallint, smallint, smallint, smallint, text),
-  public.update_rating(uuid, smallint, smallint, smallint, smallint, smallint, text),
+  public.rate_ride(uuid, uuid, integer, integer, integer, integer, integer, text),
+  public.update_rating(uuid, integer, integer, integer, integer, integer, text),
   public.delete_rating(uuid),
   public.get_ride_rating_status(uuid),
   public.get_user_ratings(uuid, integer, integer)
