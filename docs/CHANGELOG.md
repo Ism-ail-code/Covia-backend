@@ -5,6 +5,102 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+### Phase 10 — Admin dashboard backend (RBAC, user/ride management, analytics, monitoring, hardening)
+
+- `supabase/migrations/0027_admin_rbac.sql` — role-based access control:
+  `admin_roles` (super_admin / admin / moderator / support_agent), the
+  `admin_role_permissions` matrix (every role × permission pair),
+  `admin_users.role_name` (default `support_agent`); helpers
+  `is_admin()` (now "member of any admin role", backwards compatible
+  with every earlier gate), `has_permission(text)`,
+  `require_permission(text)` (raises 42501, super_admin bypasses),
+  `current_admin_role()`; role-management RPCs `admin_set_admin_role`
+  (can't change your own role; support agents can't escalate),
+  `admin_remove_admin` (can't remove yourself; Covia must always keep
+  one super admin), `admin_list_admin_users`.
+- `supabase/migrations/0028_audit_log.sql` — append-only
+  `admin_audit_log` (actor, actor_role snapshot, action, target,
+  old/new values, metadata) written exclusively by security-definer
+  `record_audit()` (no client grants); `admin_list_audit_log(actor,
+  action, target, from/to, page, page_size)` with filters +
+  `total_count`; every Phase 4 + Phase 9 admin function re-created
+  with `require_permission(...)` gates + `record_audit(...)` calls.
+- `supabase/migrations/0029_admin_user_management.sql` —
+  `profiles.is_banned` flag; `account_operational_gate` (banned or
+  actively suspended users cannot create/join rides, rate or report);
+  ride-facing gates replaced the Phase 9 creation/joining triggers
+  with a single per-table gate (`block_restricted_on_rides`) that
+  distinguishes ban / suspension / temporary restriction, respects
+  `ends_at` (lifted = unlocked) and preserves the
+  "restricted from creating/joining rides" messages; `report_user` /
+  `report_ride` / `get_public_trust_summary` re-created with the gate
+  + `is_banned`; user-management RPCs — `admin_search_users(query,
+  status, ban, page, page_size)`, `admin_get_user_profile` (jsonb:
+  identity, verification, stats, restrictions, trust, audit trail),
+  `admin_get_user_ride_history`, `admin_suspend_user`,
+  `admin_reactivate_user` (lifts suspensions + clears the ban,
+  warning stays), `admin_ban_user` (indefinite suspension +
+  `is_banned`).
+- `supabase/migrations/0030_admin_ride_management.sql` —
+  `admin_search_rides(query, status, page, page_size)`,
+  `admin_get_ride_details` (jsonb: ride + host + requests +
+  participants), `admin_get_ride_timeline`, `admin_cancel_ride` —
+  writes a new `cancelled_by_admin` timeline event that
+  `reliability_from_ride_timeline` never penalizes (host score
+  untouched); `notify_from_ride_timeline` ignores unknown event
+  types.
+- `supabase/migrations/0031_admin_verification_cases.sql` —
+  `admin_list_verifications(status, search, type, page, page_size)`
+  (signature changed — old `(text)` overload dropped), `admin_review_verification`
+  re-gated + audited, `admin_get_case_history(user_id)` (jsonb
+  dossier: verifications, rides, reports, moderation actions).
+- `supabase/migrations/0032_admin_analytics.sql` — `admin_get_analytics()`
+  one jsonb payload: users (overview incl. banned/suspended, 14-day
+  registrations, weekly retention cohorts), rides (overview +
+  average occupancy + top routes), safety (events, reports,
+  resolution), platform (db size/connections/cache hit/commit rate,
+  per-bucket storage, RPC latency + largest tables — guarded
+  `pg_stat_user_functions` / `pg_stat_user_tables` via dynamic SQL,
+  storage `size` column probed before planning).
+- `supabase/migrations/0033_admin_monitoring.sql` — `monitoring_events`
+  (source/level/message/details) written only by server-side
+  `record_monitoring_event`; `admin_list_monitoring_events(level)`;
+  `get_platform_health()` (status ok/degraded, checks array, database
+  size); `admin_update_safety_config(...)` audited wrapper over
+  `safety_config`.
+- `supabase/migrations/0034_performance_indexes.sql` — guarded
+  `pg_trgm` GIN indexes (profiles.display_name, rides.origin /
+  rides.destination — skipped when the extension is missing) + btree
+  indexes for profile lookups (email, verification_status,
+  created_at), admin searches (rides host/created_at, reports,
+  appeals, moderation, reliability, safety, notifications,
+  monitoring_events) + `analyze`.
+- `supabase/migrations/0035_security_hardening.sql` — `anon` revoked
+  from the entire admin + internal surface (all `admin_*`,
+  `record_audit`, `record_monitoring_event`, `get_platform_health`,
+  `has_permission`); `admin_roles`, `admin_role_permissions`,
+  `admin_users`, `admin_audit_log`, `monitoring_events` revoked from
+  `anon, authenticated` (direct reads/writes 42501 — moderators use
+  the RPCs); RLS stays enforced on all four admin tables.
+- `scripts/sql-smoke.mjs` — Phase 10 suite (bob promoted super_admin;
+  gina/heidi/ivan users): RBAC matrix per role, role management
+  guardrails, user search/filters/profiles/history, suspension/ban/
+  reactivation gates (ban blocks rides + reports, reactivation
+  unlocks), ride search/details/timeline/admin cancel (host
+  reliability unchanged), verification queue + case history, analytics
+  (baselines vs totals, 14-day registrations, retention shape),
+  monitoring + health + config wrapper, audit immutability (insert/
+  update/delete 42501, moderator reads via RPC only), security
+  lockdown (anon function privileges, table revokes, RLS).
+  **725/725 pass** (Phases 1–10).
+- `docs/CHANGELOG.md`, `docs/DATABASE_SCHEMA.md`,
+  `docs/API_DOCUMENTATION.md` — Phase 10 schema, RBAC/audit model and
+  RPC reference documented. New `docs/DEPLOYMENT.md` (production
+  rollout: SQL Editor migrations, extension/Realtime/pg_cron notes,
+  index strategy, monitoring + backup) and `docs/SECURITY.md`
+  (permission matrix, anon lockdown, audit trail, operational gates,
+  secure defaults checklist).
+
 ### Phase 9 — Trust (ratings, reliability, reports, appeals, moderation)
 
 - `supabase/migrations/0023_trust_schema.sql` — `ratings` (one per

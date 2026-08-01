@@ -25,6 +25,25 @@ Migrations (apply in order, in the Supabase SQL Editor):
 | `0014_rides_locations_schema.sql` | structured locations + pickup rules on `rides`, `ride_location_text()` helper, Realtime publication for `rides` / `ride_timeline` |
 | `0015_rides_write_functions.sql` | jsonb `create_ride` (canonical), extended `update_ride`, `delete_draft`, `remove_passenger`, `expire_overdue_rides` + pg_cron job |
 | `0016_rides_read_functions.sql` | extended `search_rides`/`get_ride` (expiry, `p_verified_host`), `is_user_verified(uuid)`, `ride_history` view + `get_ride_history` RPC |
+| `0017_notifications_schema.sql` | `notifications` feed, `notification_preferences`, `push_tokens`, `record_notification`, `broadcast_covia_event`, Realtime |
+| `0018_notifications_service.sql` | feed/unread/preferences RPCs, `push_tokens` management, realtime counters |
+| `0019_chat_schema.sql` | `ride_chats`, `chat_messages`, `message_reads`, chat Realtime + RLS |
+| `0020_chat_service.sql` | chat RPCs (get/send/edit/delete/search/mark-read), archive/lock, purge cron |
+| `0021_safety_schema.sql` | `emergency_contacts`, `safety_config`, `safety_events`, `live_locations`, `ride_monitoring`, `safety_event_reports`, `outbound_notifications` |
+| `0022_safety_service.sql` | SOS/check-ins/live location/monitoring/escalation RPCs, safety monitor cron |
+| `0023_trust_schema.sql` | `ratings`, `reviews`, `reports`, `appeals`, `moderation_actions`, `reliability_events`, `reliability_config`, `moderation_rules`, `trust_config` |
+| `0024_ratings_functions.sql` | double-blind rating RPCs, reciprocal/expiry reveal, profile sync |
+| `0025_reliability_moderation.sql` | reliability engine + timeline trigger, graduated moderation engine, ride/rating gates, moderation cron |
+| `0026_trust_service.sql` | reports/appeals/status/summary RPCs + admin queues |
+| `0027_admin_rbac.sql` | `admin_roles`, `admin_role_permissions`, `admin_users.role_name`, `is_admin`/`has_permission`/`require_permission`, role-management RPCs |
+| `0028_audit_log.sql` | `admin_audit_log` + `record_audit`; Phase 4 + Phase 9 admin functions re-created permission-gated + audited |
+| `0029_admin_user_management.sql` | `profiles.is_banned`, operational gates, user search/profile/history/suspend/reactivate/ban RPCs |
+| `0030_admin_ride_management.sql` | ride search/details/timeline/cancel RPCs + `cancelled_by_admin` timeline event |
+| `0031_admin_verification_cases.sql` | searchable verification queue, case-history dossier |
+| `0032_admin_analytics.sql` | `admin_get_analytics` dashboard RPC |
+| `0033_admin_monitoring.sql` | `monitoring_events` + `record_monitoring_event`, `get_platform_health`, `admin_update_safety_config` |
+| `0034_performance_indexes.sql` | guarded trigram + btree indexes for search/admin/queue paths |
+| `0035_security_hardening.sql` | anon lockdown of the admin/internal surface, table revokes, RLS enforcement |
 
 ## `public.profiles`
 
@@ -651,6 +670,166 @@ only).
   actions, reliability events: owner + admins. Config tables: no client
   access at all (owner-only, read via admin RPCs).
 - **Realtime** — `ratings` + `reviews` published (`supabase_realtime`).
+
+## Admin dashboard (0027–0035)
+
+### Roles & permissions
+
+`admin_roles`: `super_admin` | `admin` | `moderator` | `support_agent`.
+
+`admin_role_permissions` — the explicit matrix (every role ×
+permission). Seed:
+
+| Permission | super_admin | admin | moderator | support_agent |
+| --- | --- | --- | --- | --- |
+| `admin.manage`, `role.manage`, `user.ban`, `ride.cancel` | yes | yes | — | — |
+| `audit.view`, `analytics.view`, `config.view`, `config.manage`, `monitor.view` | yes | yes | — | — |
+| `user.view`, `user.manage`, `user.suspend`, `ride.view`, `report.review`, `verification.review` | yes | yes | yes | — |
+| `report.triage` | yes | yes | yes | yes |
+
+`admin_users` — `user_id` (PK → auth.users) + `role_name` (default
+`support_agent`). Membership in this table makes `is_admin()` true
+(backwards compatible with every earlier gate); the effective role
+comes from `role_name`.
+
+Helpers (security definer, revoked from `anon`): `current_admin_role()`,
+`has_permission(text)`, `require_permission(text)` (42501 with the role
+name; super_admin bypasses), `is_admin()`.
+
+Role management: `admin_set_admin_role(user_id, role_name)` (cannot
+change your own role; support agents cannot grant anything),
+`admin_remove_admin(user_id)` (cannot remove yourself; at least one
+super_admin must remain), `admin_list_admin_users()`.
+
+### `public.admin_audit_log`
+
+Append-only: `id`, `actor_user_id`, `actor_role` (snapshot at write
+time), `action` (e.g. `user.ban`, `verification.review`,
+`config.safety_update`), `target_type`, `target_id`, `old_values`,
+`new_values` (jsonb), `metadata`, `created_at`. The **only** writer is
+security-definer `record_audit(...)` — no client INSERT/UPDATE/DELETE
+grants (all three raise 42501). Reads go through
+`admin_list_audit_log(actor, action, target, from, to, page, page_size)`
+(requires `audit.view`, returns `total_count`).
+
+### `public.profiles.is_banned`
+
+Phase 10 flag set by `admin_ban_user` (which also creates an indefinite
+suspension action) and cleared by `admin_reactivate_user`. Surfaced via
+`admin_get_user_profile` and `get_public_trust_summary`.
+
+### Operational gates
+
+- `account_operational_gate(context)` — banned users are rejected first
+  ("permanently banned"); actively suspended users (status `active`
+  AND `ends_at` null-or-future) next ("suspended; you cannot …"). Used
+  by `report_user` / `report_ride` (re-created) and the ride triggers.
+- `block_restricted_on_rides()` — BEFORE INSERT trigger on `rides` and
+  `ride_requests` (replaces the Phase 9
+  `assert_ride_creation_allowed` / `assert_ride_joining_allowed`
+  triggers, which were dropped): ban → suspension →
+  temporary restriction, with the per-table verb
+  ("creating"/"joining") and lifted restrictions honored via `ends_at`.
+
+### Ride management
+
+`admin_search_rides(query, status, page, page_size)` — ILIKE over
+origin/destination/pickup/notes/host name, optional status filter,
+`passenger_count`, `total_count`. `admin_get_ride_details(ride_id)` —
+jsonb (ride, host profile, pending requests, participants).
+`admin_get_ride_timeline(ride_id)`. `admin_cancel_ride(ride_id, reason)`
+— flips the status and writes a **`cancelled_by_admin`** timeline event
+(16th type) that `reliability_from_ride_timeline` deliberately ignores,
+so admin cancellations never damage a host's reliability score.
+
+### Verification review
+
+`admin_list_verifications(status, search, type, page, page_size)` —
+new signature (old `(status)` overload dropped); text search over
+display name / email, document-type filter. `admin_review_verification`
+re-gated with `verification.review` + audited. `admin_get_case_history
+(user_id)` — jsonb dossier: verification submissions, ride history,
+reports, moderation actions.
+
+### Analytics (`admin_get_analytics()`)
+
+One jsonb payload, sections:
+
+- `users`: overview (`total_users`, `verified_users`,
+  `government_id_verified`, `student_verified`, `banned_users`,
+  `suspended_users`, `new_users_7d`, `active_users_7d`,
+  `active_users_30d`), `daily_registrations` (14-day array), `retention`
+  (weekly cohorts: signups, active next week, retention %).
+- `rides`: overview (total / published / in_progress / completed /
+  cancelled / expired, `average_occupancy`, `rides_7d`), `top_routes`
+  (top-5 completed origin → destination).
+- `safety`: total events, `by_event_type`, reports submitted / pending /
+  resolved.
+- `platform`: `notifications_sent`, `notifications_unread`,
+  `push_tokens`, `outbound_by_status` (queued/sent derived from
+  `sent_at`), `pending_outbound`, `database` (size, connections,
+  cache-hit ratio, commit rate), `storage` (per-bucket objects/bytes —
+  the `size` column is probed before planning; absent in test stubs),
+  `rpc_latency` + `largest_tables` (null when the stats views are
+  unavailable, e.g. the smoke-test harness).
+
+### Monitoring
+
+`monitoring_events`: `source`, `level` (info/warning/error/critical),
+`message`, `details` jsonb. Server-written only via
+`record_monitoring_event(...)`; `admin_list_monitoring_events(level?)`
+requires `monitor.view`. `get_platform_health()` — `status`
+(`ok`/`degraded`), `checked_at`, `checks[]` (database connectivity /
+connections / delivery queue / monitoring errors 24h / open
+emergencies / storage buckets), `database_size_mb`. Degraded when the
+queue > 50, errors in 24h, or unresolved SOS events exist.
+`admin_update_safety_config(...)` — audited admin wrapper over
+`safety_config` (records old/new values).
+
+### Performance indexes (0034)
+
+- Trigram GIN indexes on `profiles.display_name`, `rides.origin`,
+  `rides.destination` — created only when `pg_trgm` is available
+  (guarded `do` block; skipped silently on providers without it).
+- Btree: `profiles.email`, `profiles.verification_status`,
+  `profiles.created_at`, `rides.created_at`, `rides(host_id,
+  created_at desc)`, `reports` (status, created_at, target),
+  `appeals` (status, moderation_action_id), `moderation_actions`
+  (user_id + status, ends_at), `reliability_events(user_id)`,
+  `safety_events(event_type)`, `notifications(recipient_user_id,
+  created_at desc)`, `monitoring_events(created_at desc)`,
+  `outbound_notifications(created_at desc)`. All `if not exists`.
+
+### Security lockdown (0035)
+
+- `anon` loses EXECUTE on the whole admin + internal surface
+  (every `admin_*` function, `record_audit`, `record_monitoring_event`,
+  `get_platform_health`, `has_permission`, …) and SELECT on
+  `admin_roles`, `admin_role_permissions`, `admin_users`,
+  `admin_audit_log`, `monitoring_events` (plus `authenticated` for the
+  four admin tables / monitoring log — direct access raises 42501;
+  every client path is a permission-gated RPC).
+- RLS remains enabled on all four admin tables
+  (`relrowsecurity = true`) as the second line of defense.
+
+### Functions
+
+| Function | Purpose |
+| --- | --- |
+| `current_admin_role()` / `has_permission(text)` / `require_permission(text)` | RBAC resolution (super_admin bypass) |
+| `admin_set_admin_role(uuid, text)` / `admin_remove_admin(uuid)` / `admin_list_admin_users()` | team management (self-change/removal blocked, super_admin kept) |
+| `record_audit(...)` | server-only audit writer |
+| `admin_list_audit_log(actor, action, target, from, to, page, page_size)` | audit trail with filters + total_count |
+| `admin_search_users(query, status, ban, page, page_size)` | user directory (name/email, verification, ban filters) |
+| `admin_get_user_profile(uuid)` | full admin dossier (jsonb) |
+| `admin_get_user_ride_history(uuid, page, page_size)` | ride history with relation/status |
+| `admin_suspend_user(uuid, hours, reason)` / `admin_reactivate_user(uuid, reason)` / `admin_ban_user(uuid, reason)` | enforcement (ban = indefinite suspension + flag) |
+| `admin_search_rides(query, status, page, page_size)` / `admin_get_ride_details(uuid)` / `admin_get_ride_timeline(uuid)` / `admin_cancel_ride(uuid, text)` | ride management |
+| `admin_list_verifications(status, search, type, page, page_size)` / `admin_review_verification(uuid, action, reason?)` / `admin_get_case_history(uuid)` | verification desk |
+| `admin_get_analytics()` | dashboard (users/rides/safety/platform) |
+| `record_monitoring_event(...)` / `admin_list_monitoring_events(level?)` / `get_platform_health()` | monitoring |
+| `admin_update_safety_config(...)` | audited config tuning |
+| `account_operational_gate(text)` / `block_restricted_on_rides()` | ban/suspension enforcement (rides + ride_requests triggers) |
 
 ## Mobile model mapping
 

@@ -7,15 +7,19 @@ This repository currently contains **Phase 1: infrastructure** plus the
 **Phase 2 Supabase support** (auth schema + setup guide), **Phase 3 user
 profiles** (identity fields, username rules, public/private profile model,
 avatar storage), **Phase 4 identity verification** (government ID +
-student checks, private document storage, admin review functions) and
+student checks, private document storage, admin review functions),
 **Phase 5 ride management & matching** (ride lifecycle, request/approval
 workflow, capacity + overlap enforcement, search/discovery, timeline)
 plus the **Phase 5b extension** (structured pickup/destination
 locations, public-place pickup rules, scheduled visibility, auto-expiry
-of unpublished rides, passenger removal, ride history).
+of unpublished rides, passenger removal, ride history), **Phase 6
+notifications**, **Phase 7 ride chat**, **Phase 8 safety** (emergency
+contacts, SOS, ride monitoring), **Phase 9 trust** (ratings, reliability,
+reports, appeals, moderation) and **Phase 10 admin dashboard backend**
+(RBAC, user/ride management, verification review, analytics, monitoring,
+audit log, performance indexes, security hardening).
 Ride **screens** are not wired yet; the backend RPCs, mobile service layer
-and documentation are in place. Chat, ratings and payments remain future
-phases.
+and documentation are in place. Payments remain a future phase.
 
 > Authentication, profiles and the ride layer for the mobile app run on
 > **Supabase** (Auth + Postgres + Storage). This repo ships the schema
@@ -114,7 +118,7 @@ migrations:
 
 ```bash
 pnpm db:dev:start          # boot the database (terminal)
-node scripts/sql-smoke.mjs # apply supabase/migrations/* to a scratch DB + assert (303 checks)
+node scripts/sql-smoke.mjs # apply supabase/migrations/* to a scratch DB + assert (725 checks)
 ```
 
 ## Repository layout

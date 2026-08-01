@@ -355,6 +355,97 @@ and riders subscribe via `postgres_changes`.
 Realtime: `ratings` and `reviews` are published (`supabase_realtime`) —
 the client refreshes profile blocks on reveal.
 
+## Admin dashboard (Phase 10)
+
+### RBAC helpers (callable by anyone — they never raise for non-admins)
+
+- `is_admin()` — boolean; true for members of any admin role.
+- `current_admin_role()` — `super_admin` / `admin` / `moderator` /
+  `support_agent`, or null for regular users.
+- `has_permission(text)` — boolean; `super_admin` always true.
+  (All other Phase 10 RPCs call `require_permission` internally and
+  raise `P0001` "Permission denied: <role> cannot <permission>" — a
+  `42501` SQLSTATE — when the caller lacks the permission.)
+
+### Team management (`admin.manage` / `role.manage`)
+
+- `admin_list_admin_users()` — id, email, display name, role.
+- `admin_set_admin_role(p_user_id, p_role_name)` — grants/revokes a
+  role. Guardrails: you cannot change your own role; `support_agent`
+  cannot grant anything (`role.manage` required).
+- `admin_remove_admin(p_user_id)` — revokes membership. You cannot
+  remove yourself; Covia must keep at least one super admin.
+
+### User management (`user.view` / `user.manage` / `user.suspend` / `user.ban`)
+
+- `admin_search_users(p_query?, p_status?, p_banned?, p_page?, p_page_size?)`
+  — name/email ILIKE, verification-status + ban filters,
+  `total_count`.
+- `admin_get_user_profile(p_user_id)` — jsonb dossier: identity,
+  verification, ride stats, active restrictions, trust summary,
+  recent audit trail.
+- `admin_get_user_ride_history(p_user_id, p_page?, p_page_size?)` —
+  rides hosted/joined/requested with relation + status.
+- `admin_suspend_user(p_user_id, p_duration_hours, p_reason)` —
+  temporary suspension (ride creation/joining/rating/reporting
+  blocked while active).
+- `admin_reactivate_user(p_user_id, p_reason)` — lifts active
+  suspensions, clears the ban flag; warnings stay on record.
+- `admin_ban_user(p_user_id, p_reason)` — permanent ban (indefinite
+  suspension + `is_banned`); banned users cannot create/join rides,
+  rate, or file reports.
+
+### Ride management (`ride.view` / `ride.cancel`)
+
+- `admin_search_rides(p_query?, p_status?, p_page?, p_page_size?)` —
+  route/host ILIKE, status filter, passenger counts.
+- `admin_get_ride_details(p_ride_id)` — jsonb (ride, host, pending
+  requests, participants).
+- `admin_get_ride_timeline(p_ride_id)` — full event history.
+- `admin_cancel_ride(p_ride_id, p_reason)` — flips the ride to
+  `cancelled` and writes a `cancelled_by_admin` timeline event.
+  **Never affects the host's reliability score.**
+
+### Verification desk (`verification.review`)
+
+- `admin_list_verifications(p_status?, p_search?, p_type?, p_page?,
+  p_page_size?)` — queue with text + document-type filters.
+- `admin_review_verification(p_submission_id, p_action, p_reason?)` —
+  approve / reject / request_resubmission (audited).
+- `admin_get_case_history(p_user_id)` — jsonb dossier
+  (verifications, rides, reports, moderation actions) for a full
+  picture before deciding.
+
+### Analytics (`analytics.view`)
+
+- `admin_get_analytics()` — one jsonb payload with `users`
+  (overview, 14-day registrations, weekly retention cohorts),
+  `rides` (overview, average occupancy, top routes), `safety`
+  (events + reports), `platform` (db/storage stats, outbound queue).
+
+### Monitoring (`monitor.view`)
+
+- `get_platform_health()` — `status` (`ok`/`degraded`), `checks[]`,
+  `database_size_mb`. Degraded when the outbound queue > 50, errors
+  occurred in 24h, or an SOS is unresolved.
+- `admin_list_monitoring_events(p_level?)` — server-written events
+  (info/warning/error/critical), newest first, `total_count`.
+- `admin_update_safety_config(p_route_deviation_meters?, …)` — audited
+  tuning of `safety_config` (old/new values recorded in the audit log).
+
+### Audit log (`audit.view`)
+
+- `admin_list_audit_log(p_actor?, p_action?, p_target?, p_from?,
+  p_to?, p_page?, p_page_size?)` — filterable, newest first,
+  `total_count`. Direct table access raises 42501 for every client
+  role — the RPC is the only read path; writes flow exclusively
+  through the server-side `record_audit`.
+
+Errors: `P0001` "Permission denied: …" (42501) for missing
+permissions; `P0001` friendly text for guardrail violations
+("cannot change your own role", "cannot remove yourself", "Covia
+must keep at least one super admin", "User not found", …).
+
 ## Error conventions
 
 RPCs raise with a friendly `message` and a SQLSTATE `code`:
