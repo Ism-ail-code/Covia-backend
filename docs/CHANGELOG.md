@@ -36,12 +36,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
   fallback, pagination ≤ 50, `total_count` window, host profile joins),
   `get_ride` (drafts host-only), `get_ride_requests` (host queue),
   `get_ride_participants` (members), `get_ride_timeline` (members).
+- `supabase/migrations/0014_rides_locations_schema.sql` — structured
+  locations on `rides`: `pickup_type` (main-road/landmark/university/
+  bus-stop/metro-station/shopping-centre — residential rejected),
+  jsonb `origin_loc` / `destination_loc` / `pickup_point_loc` /
+  `destination_point_loc` (`display_name`, `latitude`, `longitude`,
+  `place_id`, `full_address`), `smart_fare_details`, `visible_at`
+  (scheduled search visibility); `ride_location_text()` validator
+  helper (revoked from `public`); guarded Supabase Realtime publication
+  for `rides` + `ride_timeline`.
+- `supabase/migrations/0015_rides_write_functions.sql` — jsonb
+  `create_ride` (canonical; legacy text overload dropped — never
+  deployed, would be ambiguous), extended `update_ride` (locations,
+  pickup type, visibility, smart-fare details), `delete_draft`
+  (drafts only — everything else is cancelled/expired), `remove_passenger`
+  (pre-start, seat freed, `dropped` event), `expire_overdue_rides()`
+  (published/full rides past departure → `expired`; guarded pg_cron job
+  `covia-expire-rides` every 15 min, skipped if pg_cron is missing).
+- `supabase/migrations/0016_rides_read_functions.sql` — extended
+  `search_rides` (`p_verified_host` filter; lazy expiry purge) and
+  `get_ride` (expired rides stay visible to host + members);
+  `is_user_verified(uuid)`; security-barrier `ride_history` view
+  (scoped to `auth.uid()`) + `get_ride_history(p_relation, p_status,
+  p_page, p_page_size)`; "rides published read" RLS policy recreated to
+  include `expired` status.
 - `scripts/sql-smoke.mjs` — Phase 5 assertions: schema/grants, verified
   gates, creation validations, publish/republish, request/approve/reject/
   withdraw, overlap + duplicate + capacity rules, seat floor, lifecycle
   transitions incl. invalid ones, counter updates, timeline event sets,
   search filters/sort/pagination, RPC member gating, direct-write
-  blocking. **246/246 pass** (Phases 1–4 + 5).
+  blocking. **303/303 pass** (Phases 1–4 + 5), including the Phase 5b
+  suite: structured locations (validation, lat/lng bounds, display-name
+  extraction), pickup-type rules, visibility scheduling, expiry
+  (cron + lazy paths), delete_draft, remove_passenger, verified-host
+  filter, ride history view + RPC.
 - `docs/DATABASE_SCHEMA.md` — ride tables, lifecycle matrix, RLS and
   functions documented; `docs/API_DOCUMENTATION.md` — RPC reference with
   permissions, statuses and error conventions.

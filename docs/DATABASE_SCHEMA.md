@@ -22,6 +22,9 @@ Migrations (apply in order, in the Supabase SQL Editor):
 | `0011_rides_request_functions.sql` | request/approval workflow: `request_to_join`, `cancel_ride_request`, `leave_ride`, `host_respond_to_request` |
 | `0012_rides_lifecycle_functions.sql` | `start_ride`, `complete_ride`, `cancel_ride` |
 | `0013_rides_read_functions.sql` | `search_rides`, `get_ride`, `get_ride_requests`, `get_ride_participants`, `get_ride_timeline` |
+| `0014_rides_locations_schema.sql` | structured locations + pickup rules on `rides`, `ride_location_text()` helper, Realtime publication for `rides` / `ride_timeline` |
+| `0015_rides_write_functions.sql` | jsonb `create_ride` (canonical), extended `update_ride`, `delete_draft`, `remove_passenger`, `expire_overdue_rides` + pg_cron job |
+| `0016_rides_read_functions.sql` | extended `search_rides`/`get_ride` (expiry, `p_verified_host`), `is_user_verified(uuid)`, `ride_history` view + `get_ride_history` RPC |
 
 ## `public.profiles`
 
@@ -209,7 +212,7 @@ Admin side (security definer, guarded by `is_admin()`, `authenticated` only):
   - admins: must use a service-role client (NestJS admin API, future phase)
     — the anon key cannot sign URLs for other users' documents.
 
-## Ride coordination (0009–0013)
+## Ride coordination (0009–0016)
 
 Phase 5 feature: verified travellers coordinate seats on a shared
 vehicle. Covia is **not** ride-hailing — it only manages bookings on
@@ -224,6 +227,7 @@ draft → published → full → in_progress → completed
     \       \        \     \→ cancelled
      \      \→ cancelled
       \→ cancelled
+published / full →(departure passed, never started)→ expired
 ```
 
 | Status | Meaning | Entered via |
@@ -234,14 +238,29 @@ draft → published → full → in_progress → completed
 | `in_progress` | departed | `start_ride` (host) |
 | `completed` | finished; reliability counters updated | `complete_ride` (host) |
 | `cancelled` | host cancelled pre-start; open requests closed | `cancel_ride` (host) |
+| `expired` | departure passed without starting; archived, never deleted | `expire_overdue_rides()` (pg_cron, every 15 min) |
 
-Rules enforced in the functions (0010–0012):
+Rules enforced in the functions (0010–0012, 0015):
 
 - Only **verified users** create rides / request seats
   (`is_user_verified()` — any approved method); verified **students**
   only may create `student_only` rides.
-- Departure must be in the future; seats 1–10; pickup point required;
-  `fixed` fares need a per-seat amount, `smart` fares must not have one.
+- Departure must be in the future; seats 1–10; `fixed` fares need a
+  per-seat amount, `smart` fares must not have one.
+- **Structured locations** (0014): `create_ride` takes `origin_loc`,
+  `destination_loc`, `pickup_point_loc` jsonb objects (display name ≤
+  160 chars, optional lat/lng within ±90/±180); display names are
+  copied into the legacy text columns for search. The **pickup point
+  must be a public place** — `main_road | landmark | university |
+  bus_stop | metro_station | shopping_center` (residential addresses
+  are rejected).
+- **Visibility scheduling** (0015): `visible_at` schedules when a ride
+  appears in search; must be in the future and before departure.
+- **Expiry** (0015): published/full rides whose departure passes
+  without starting are archived `expired` — they leave search, stop
+  accepting requests, open requests close, and they are never deleted.
+  Runs via pg_cron (`covia-expire-rides`, every 15 min) and lazily
+  inside `search_rides`/`get_ride`.
 - Seat edits cannot drop below the approved passenger headcount.
 - Requests: pending-only duplicates rejected (23505), hosts cannot
   request their own ride, no **overlapping rides** — an active seat or
@@ -257,6 +276,9 @@ Rules enforced in the functions (0010–0012):
 - `complete_ride` increments `total_completed_rides` for the host and
   every passenger who stayed; `cancel_ride` increments
   `total_cancelled_rides` for the host.
+- The host can **remove a passenger** before the ride starts
+  (`remove_passenger`); drafts are the only rides that can be deleted
+  (`delete_draft`) — everything else is cancelled or expired instead.
 
 ### `public.rides`
 
@@ -264,9 +286,13 @@ Rules enforced in the functions (0010–0012):
 | --- | --- | --- |
 | id | uuid PK | `gen_random_uuid()` |
 | host_id | uuid FK → auth.users | owner; `on delete cascade` |
-| origin / destination | text | 1–120 chars, trimmed |
+| origin / destination | text | 1–120 chars, trimmed; display-name copies of the location objects |
 | pickup_point / destination_point | text | 1–160 chars (destination optional) |
-| origin_lat / lng, destination_lat / lng | numeric(9,6) | optional — geocoding is a later phase |
+| pickup_type | text | `main_road` / `landmark` / `university` / `bus_stop` / `metro_station` / `shopping_center` |
+| origin_loc / destination_loc / pickup_point_loc / destination_point_loc | jsonb | structured locations (0014): `display_name`, `latitude`, `longitude`, `place_id`, `full_address` |
+| smart_fare_details | jsonb | smart-fare pricing model (0015); only on `smart` fares |
+| visible_at | timestamptz | scheduled search visibility (0015); future + pre-departure |
+| origin_lat / lng, destination_lat / lng | numeric(9,6) | copied from the location objects for distance sort |
 | departure_time | timestamptz | must be in the future when created/edited |
 | estimated_arrival | timestamptz | > departure_time |
 | total_seats | integer | 1–10 |
@@ -306,14 +332,14 @@ Partial unique index `(ride_id, passenger_id) where status = 'pending'`
 
 Every event, timestamped — powers the activity feed and notifications
 in later phases. Columns: `id`, `ride_id` (FK, cascade), `event_type`
-(one of 13 values), `actor_id` (FK → auth.users, set null on delete),
+(one of 15 values), `actor_id` (FK → auth.users, set null on delete),
 `metadata` jsonb, `created_at`.
 
 Event types: `created`, `published`, `requested`, `request_cancelled`,
 `approved`, `rejected`, `joined`, `left`, `ride_full`, `edited`,
-`started`, `completed`, `cancelled`. Written only by the security
-definer `record_ride_event(ride_id, event, actor, metadata)` helper
-(revoked from `public`).
+`started`, `completed`, `cancelled`, `dropped`, `expired`. Written only
+by the security definer `record_ride_event(ride_id, event, actor,
+metadata)` helper (revoked from `public`).
 
 ### Row Level Security
 
@@ -336,26 +362,31 @@ writes timeline events):
 
 | Function | Purpose |
 | --- | --- |
-| `create_ride(p_origin, p_destination, p_pickup_point, p_departure_time, p_total_seats, p_fare_mode, p_fixed_fare, p_notes, p_destination_point, p_is_student_only, p_is_women_only, p_estimated_arrival)` | validated draft ride (verified host only) |
+| `create_ride(p_origin_loc, p_destination_loc, p_pickup_point_loc, p_departure_time, p_total_seats, p_fare_mode, p_fixed_fare, p_notes, p_destination_point_loc, p_is_student_only, p_is_women_only, p_pickup_type, p_visible_at, p_estimated_arrival, p_smart_fare_details)` | validated draft ride from **structured locations** (verified host only); pickup must be a public place (0014/0015) |
 | `publish_ride(p_ride_id)` | draft → published; host joins as participant |
-| `update_ride(p_ride_id, p_departure_time, p_pickup_point, p_notes, p_total_seats, p_fare_mode, p_fixed_fare)` | host edits pre-start; seat floor + auto `full`/`published` restatus |
+| `update_ride(p_ride_id, p_departure_time, p_pickup_point, p_notes, p_total_seats, p_fare_mode, p_fixed_fare, p_destination, p_destination_point, p_pickup_type, p_visible_at, p_origin_loc, p_destination_loc, p_pickup_point_loc, p_destination_point_loc, p_smart_fare_details)` | host edits pre-start; seat floor + auto `full`/`published` restatus; locations re-validated |
+| `delete_draft(p_ride_id)` | host-only; **drafts** are deleted, every other status must be cancelled/expired instead |
 | `request_to_join(p_ride_id)` | verified passenger request; duplicates 23505, overlap checks |
 | `cancel_ride_request(p_request_id)` | passenger withdraws a pending request |
 | `leave_ride(p_ride_id)` | passenger leaves pre-start; seat freed, `full` → `published` |
 | `host_respond_to_request(p_request_id, p_approve, p_reason)` | approve (capacity-checked, adds participant, last seat → `full` + `ride_full` event) or reject with reason |
+| `remove_passenger(p_ride_id, p_passenger_id)` | host removes a passenger pre-start; seat freed (`dropped` event) |
 | `start_ride(p_ride_id)` | published/full → in_progress (host) |
 | `complete_ride(p_ride_id)` | in_progress → completed; increments reliability counters |
 | `cancel_ride(p_ride_id)` | pre-start cancel (host); closes pending requests, records counter |
+| `expire_overdue_rides()` | archives published/full rides past departure as `expired` (pg_cron `covia-expire-rides` every 15 min; also called lazily by `search_rides`/`get_ride`) |
 
 Read side (security definer, `authenticated` only):
 
 | Function | Purpose |
 | --- | --- |
-| `search_rides(p_origin, p_destination, p_date, p_time_from, p_available_seats, p_student_only, p_women_only, p_sort, p_origin_lat, p_origin_lng, p_page, p_page_size)` | published/full rides only; ILIKE filters; sort departure/recent/distance (haversine, nulls last when no coordinates); `total_count` via window; pagination (page size ≤ 50) |
+| `search_rides(p_origin, p_destination, p_date, p_time_from, p_available_seats, p_student_only, p_women_only, p_sort, p_origin_lat, p_origin_lng, p_verified_host, p_page, p_page_size)` | published/full rides only (expired excluded); ILIKE filters; sort departure/recent/distance (haversine, nulls last when no coordinates); `p_verified_host` filters to verified hosts only; `total_count` via window; pagination (page size ≤ 50) |
 | `get_ride(p_ride_id)` | detail + host public profile; drafts visible only to the host; otherwise "Ride not found" |
 | `get_ride_requests(p_ride_id)` | host-only request queue with passenger public profiles |
 | `get_ride_participants(p_ride_id)` | members-only roster (Host first) |
 | `get_ride_timeline(p_ride_id)` | members-only chronological events with actor names |
+| `get_ride_history(p_relation, p_status, p_page, p_page_size)` | the caller's own history via the `ride_history` security-barrier view — `hosted` / `joined` / `requested` (null = all), optional ride-status filter, paginated with `total_count` |
+| `is_user_verified(p_user_id)` | same gate as `is_user_verified()` but for an arbitrary user (used by `search_rides`' `p_verified_host` filter) |
 
 ## Mobile model mapping
 
@@ -373,9 +404,13 @@ Read side (security definer, `authenticated` only):
   tiles per document, kind + method selectors, live status cards
   (pending / approved / rejected with reason / expired), resubmission.
 - `src/types/ride.ts` — `Ride`, `RideRequest`, `RideParticipant`,
-  `RideTimelineEvent`, status/event/fare label maps, search filters.
+  `RideTimelineEvent`, `RideLocation` (structured locations),
+  `PickupType` + labels, `RideHistoryEntry`/`RideHistoryRelation`,
+  status/event/fare label maps, search filters.
 - `src/services/rides.ts` — every write RPC (create/publish/update/
-  request/cancel-request/leave/respond/start/complete/cancel) + the read
-  functions (search/get/requests/participants/timeline), client-side
-  `validateRideInput`, friendly `RideError` mapping. Numeric columns
-  (numeric/bigint) are cast from strings.
+  delete-draft/request/cancel-request/leave/respond/remove-passenger/
+  start/complete/cancel) + the read functions (search/get/requests/
+  participants/timeline/history), client-side `validateRideInput`
+  (structured locations + pickup rules + visibility window), friendly
+  `RideError` mapping. Numeric columns (numeric/bigint) are cast from
+  strings.

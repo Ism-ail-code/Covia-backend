@@ -96,12 +96,26 @@ companion://reset
    - `supabase/migrations/0012_rides_lifecycle_functions.sql` —
      `start_ride` / `complete_ride` / `cancel_ride`.
    - `supabase/migrations/0013_rides_read_functions.sql` — `search_rides`
-     / `get_ride` / `get_ride_requests` / `get_ride_participants` /
-     `get_ride_timeline`.
+      / `get_ride` / `get_ride_requests` / `get_ride_participants` /
+      `get_ride_timeline`.
+   - `supabase/migrations/0014_rides_locations_schema.sql` — structured
+      location columns + pickup rules on `rides` (`pickup_type`,
+      `origin_loc`, `destination_loc`, `pickup_point_loc`,
+      `destination_point_loc`, `smart_fare_details`, `visible_at`) and
+      the Realtime publication for `rides` / `ride_timeline`.
+   - `supabase/migrations/0015_rides_write_functions.sql` — jsonb
+      `create_ride` (canonical — the legacy text version is dropped),
+      extended `update_ride`, `delete_draft`, `remove_passenger`,
+      `expire_overdue_rides` (needs **pg_cron** — available on all
+      Supabase plans; the job creation is guarded and silently skipped
+      if the extension is missing).
+   - `supabase/migrations/0016_rides_read_functions.sql` — extended
+      `search_rides` (`p_verified_host`), `get_ride_history` +
+      `ride_history` view, `is_user_verified(uuid)`.
 
    Local SQL can be smoke-tested against the embedded PostgreSQL before
    applying anywhere: `node scripts/sql-smoke.mjs` (database must be
-   running — `pnpm db:dev:start`). **246 checks cover Phases 1–5.**
+   running — `pnpm db:dev:start`). **303 checks cover Phases 1–5.**
 
 3. Verify with:
 
@@ -188,9 +202,17 @@ passenger (approve their verification first), plus one unverified user.
 
 - [ ] Unverified users cannot create rides or request seats (friendly
       "verify first" message).
-- [ ] Verified host creates a ride → `ride_status = 'draft'` with
-      `available_seats = total_seats`; past departures, empty fields, seat
-      counts outside 1–10, and missing/invalid fares are rejected.
+- [ ] Verified host creates a ride with **structured locations** →
+      `ride_status = 'draft'` with `available_seats = total_seats`;
+      past departures, missing/oversized display names, out-of-range
+      coordinates, seat counts outside 1–10, and missing/invalid fares
+      are rejected.
+- [ ] Pickup rules: a **residential** pickup point is rejected; a
+      main-road/landmark/university/bus-stop/metro-station/shopping-centre
+      pickup is accepted.
+- [ ] Visibility: `visible_at` in the past or at/after departure is
+      rejected; a future `visible_at` keeps the ride out of search
+      until it passes.
 - [ ] Student-only rides: rejected for non-students, allowed for verified
       students.
 - [ ] `publish_ride` → status `published`; the host appears in
@@ -205,22 +227,34 @@ passenger (approve their verification first), plus one unverified user.
 - [ ] Host rejects with a reason → `rejected`; passenger sees the reason.
 - [ ] Passenger withdraws a pending request; a passenger on the ride can
       `leave_ride` before departure (seat freed, ride re-opens from `full`).
+- [ ] Host removes a passenger via `remove_passenger` (pre-start) → seat
+      freed, `dropped` timeline event; host cannot remove a passenger
+      after the ride starts.
 - [ ] Host edits: past departure / seats below approved passengers are
       rejected; seat changes restatus `full`/`published` correctly.
+- [ ] `delete_draft` removes a draft; published/started rides refuse it
+      ("cancelled or completed instead").
 - [ ] `start_ride` → `in_progress` (host only); `complete_ride` →
       `completed` and `total_completed_rides` increments for host +
       passengers; `cancel_ride` (pre-start) → `cancelled`, pending requests
       closed, `total_cancelled_rides` incremented; no double cancels or
       cancels after start.
+- [ ] **Expiry**: a published ride left past its departure becomes
+      `expired` (via pg_cron or the next `search_rides` call) — it leaves
+      search, pending requests close, an `expired` timeline event is
+      recorded, and it is never deleted.
 - [ ] `search_rides` returns only published/full rides and honours origin/
-      destination/date/time/seat/student/women filters, sorts
+      destination/date/time/seat/student/women/verified-host filters, sorts
       (departure/recent/distance) and pagination (`total_count` matches).
+- [ ] `get_ride_history` returns the caller's hosted/joined/requested
+      rides with correct relation labels and `total_count`.
 - [ ] `get_ride` hides drafts from non-hosts; `get_ride_requests` is
       host-only; participants/timeline are member-only.
 - [ ] Direct `insert`/`update` on ride tables fails (select-only grants).
 - [ ] Timeline shows the full event sequence for a ride
       (created → published → requested → approved → joined → ride_full →
-      … started → completed / cancelled).
+      … started → completed / cancelled; dropped / expired where
+      applicable).
 
 ## Notes & security
 
