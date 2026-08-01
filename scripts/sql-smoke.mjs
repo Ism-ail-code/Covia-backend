@@ -267,7 +267,7 @@ async function main() {
   assert(statusDef.rows.some((r) => r.def.includes("'expired'")), 'verification status check includes expired');
 
   // Make bob an admin; alice starts a government ID verification.
-  await vClient.query(`insert into public.admin_users (user_id) values ($1)`, [user2]);
+  await vClient.query(`insert into public.admin_users (user_id, role_name) values ($1, 'admin')`, [user2]);
   await vClient.query(`set role authenticated`);
   await vClient.query(`select set_config('request.jwt.claim.sub', $1, false)`, [user1]);
 
@@ -2487,7 +2487,7 @@ async function main() {
   await asUser(user4);
   const nonAdminRules = await rideClient.query(`select * from public.admin_update_moderation_rule('cancellations_warning', 1)`)
     .then(() => null).catch((e) => e.message ?? '');
-  assert(typeof nonAdminRules === 'string' && nonAdminRules.includes('Admin access required'), 'rule changes are admin-only');
+  assert(typeof nonAdminRules === 'string' && nonAdminRules.includes('Permission denied'), 'rule changes are admin-only');
   // Frank hosts two rides and cancels both.
   await asUser(user7);
   const f1 = await createRide('Ikeja', 'VI', 'Jibowu', 130, 2, 'fixed', 1500);
@@ -2572,7 +2572,7 @@ async function main() {
   await asUser(user5);
   const manual = await rideClient.query(`select * from public.admin_apply_moderation_action($1, 'warning', 'Be more careful')`, [user7])
     .then(() => null).catch((e) => e.message ?? '');
-  assert(typeof manual === 'string' && manual.includes('Admin access required'), 'manual actions are admin-only');
+  assert(typeof manual === 'string' && manual.includes('Permission denied'), 'manual actions are admin-only');
   await asUser(user2);
   const manualWarn = await rideClient.query(`select * from public.admin_apply_moderation_action($1, 'warning', 'Friendly nudge')`, [user5]);
   assert(manualWarn.rows[0].action_type === 'warning' && Number(manualWarn.rows[0].severity) === 1, 'manual warning applied (severity 1)');
@@ -2604,7 +2604,7 @@ async function main() {
   assert(Number(pubTrust.rows[0].s.average_rating) === 4.5 && pubTrust.rows[0].s.reports_received_total === undefined, 'public summary reveals only public metrics');
   const adminBlock = await rideClient.query(`select * from public.admin_get_trust_summary($1)`, [user6])
     .then(() => null).catch((e) => e.message ?? '');
-  assert(typeof adminBlock === 'string' && adminBlock.includes('Admin access required'), 'admin trust summary is admin-only');
+  assert(typeof adminBlock === 'string' && adminBlock.includes('Permission denied'), 'admin trust summary is admin-only');
   await asUser(user2);
   const adminTrust = await rideClient.query(`select public.admin_get_trust_summary($1) as s`, [user6]);
   assert(Number(adminTrust.rows[0].s.average_rating) === 4.5, 'admins read any user summary');
@@ -2635,6 +2635,275 @@ async function main() {
   await asUser(user6);
   const evtRead = await rideClient.query(`select count(*)::int as n from public.reliability_events where user_id = $1`, [user6]);
   assert(evtRead.rows[0].n === 3, 'users read their own reliability events');
+
+  // ── Phase 10: admin dashboard, RBAC, audit, analytics, monitoring ──
+  await rideClient.query('reset role');
+  const [user8, user9, user10] = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+  await rideClient.query(
+    `insert into auth.users (id, email, raw_user_meta_data) values
+       ($1, 'gina@example.com', '{"full_name":"Gina Moderator"}'),
+       ($2, 'heidi@example.com', '{"full_name":"Heidi Support"}'),
+       ($3, 'ivan@example.com', '{"full_name":"Ivan User"}')`,
+    [user8, user9, user10],
+  );
+  // bob is promoted to super_admin; gina moderates, heidi triages.
+  await rideClient.query(`update public.admin_users set role_name = 'super_admin' where user_id = $1`, [user2]);
+  await rideClient.query(`insert into public.admin_users (user_id, role_name) values ($1, 'moderator'), ($2, 'support_agent')`, [user8, user9]);
+  await rideClient.query('set role authenticated');
+
+  // RBAC: every role resolves the permission matrix.
+  await asUser(user2);
+  const rbac = await rideClient.query(`select public.current_admin_role() as r, public.is_admin() as a,
+    public.has_permission('admin.manage') as pm, public.has_permission('user.manage') as pu`);
+  assert(rbac.rows[0].r === 'super_admin' && rbac.rows[0].a === true && rbac.rows[0].pm === true && rbac.rows[0].pu === true, 'super admin has every permission');
+  await asUser(user8);
+  const modPerms = await rideClient.query(`select public.current_admin_role() as r,
+    public.has_permission('report.review') as pr, public.has_permission('user.manage') as pu`);
+  assert(modPerms.rows[0].r === 'moderator' && modPerms.rows[0].pr === true && modPerms.rows[0].pu === false, 'moderator permissions are scoped');
+  await asUser(user9);
+  const supportPerms = await rideClient.query(`select public.has_permission('user.view') as pv,
+    public.has_permission('report.review') as pr, public.has_permission('analytics.view') as pa`);
+  assert(supportPerms.rows[0].pv === true && supportPerms.rows[0].pr === false && supportPerms.rows[0].pa === false, 'support agents only triage');
+  await asUser(user5);
+  const nonAdminPerms = await rideClient.query(`select public.has_permission('user.view') as pv, public.is_admin() as a`);
+  assert(nonAdminPerms.rows[0].pv === false && nonAdminPerms.rows[0].a === false, 'regular users have no admin permissions');
+  const nonAdminCall = await rideClient.query(`select * from public.admin_search_users(null)`)
+    .then(() => null).catch((e) => e.code);
+  assert(nonAdminCall === '42501', 'regular users cannot call admin APIs');
+
+  // Super admin account management (escalation, self-change, removal).
+  await asUser(user9);
+  const escRole = await rideClient.query(`select * from public.admin_set_admin_role($1, 'super_admin')`, [user9])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof escRole === 'string' && escRole.includes('Permission denied'), 'support agents cannot escalate roles');
+  await asUser(user2);
+  const selfRole = await rideClient.query(`select * from public.admin_set_admin_role($1, 'admin')`, [user2])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof selfRole === 'string' && selfRole.includes('cannot change your own role'), 'admins cannot change their own role');
+  await rideClient.query(`select * from public.admin_set_admin_role($1, 'super_admin')`, [user8]);
+  await rideClient.query(`select * from public.admin_set_admin_role($1, 'moderator')`, [user8]);
+  await rideClient.query(`select * from public.admin_set_admin_role($1, 'admin')`, [user9]);
+  const teamRows = (await rideClient.query(`select * from public.admin_list_admin_users()`)).rows;
+  assert(teamRows.some((r) => r.user_id === user2 && r.role_name === 'super_admin'), 'super admin listed');
+  assert(teamRows.some((r) => r.user_id === user8 && r.role_name === 'moderator'), 'moderator listed');
+  assert(teamRows.some((r) => r.user_id === user9 && r.role_name === 'admin'), 'promoted admin listed');
+  await rideClient.query(`select * from public.admin_remove_admin($1)`, [user9]);
+  const teamAfter = await rideClient.query(`select * from public.admin_list_admin_users()`);
+  assert(!teamAfter.rows.some((r) => r.user_id === user9), 'admins can be removed');
+  const selfRemove = await rideClient.query(`select * from public.admin_remove_admin($1)`, [user2])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof selfRemove === 'string' && selfRemove.includes('cannot remove yourself'), 'admins cannot remove themselves');
+  await rideClient.query(`select * from public.admin_set_admin_role($1, 'support_agent')`, [user9]);
+
+  // User management: search, profile, ride history, enforcement.
+  const searchDan = await rideClient.query(`select * from public.admin_search_users('dan')`);
+  assert(Number(searchDan.rows[0].total_count) === 1 && searchDan.rows[0].id === user5, 'user search by name');
+  const searchVerified = await rideClient.query(`select * from public.admin_search_users(null, 'Verified')`);
+  assert(Number(searchVerified.rows[0].total_count) >= 4, 'verification status filter');
+  const searchSusp = await rideClient.query(`select * from public.admin_search_users(null, null, 'suspended')`);
+  assert(Number(searchSusp.rows[0].total_count) === 1 && searchSusp.rows[0].id === user7 && searchSusp.rows[0].is_suspended === true, 'suspended filter finds frank');
+  const p5 = (await rideClient.query(`select public.admin_get_user_profile($1) as p`, [user5])).rows[0].p;
+  assert(p5.display_name === 'Dan Example' && p5.is_banned === false && Number(p5.active_restrictions) === 0 && p5.latest_verification.status === 'approved', 'full admin profile for dan');
+  const hist = await rideClient.query(`select * from public.admin_get_user_ride_history($1)`, [user5]);
+  assert(Number(hist.rows[0].total_count) >= 4 && hist.rows.every((r) => r.role === 'Host'), 'dan ride history lists his hosted rides');
+  await asUser(user7);
+  const suspCreate = await rideClient.query(`select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 2, 'fixed', 1000, null, null, false, false, 'bus_stop')`,
+    [locJson('Ikeja'), locJson('VI'), locJson('Jibowu'), dep(240)])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof suspCreate === 'string' && suspCreate.includes('suspended'), 'suspended users cannot create rides');
+  await asUser(user2);
+  const ban = await rideClient.query(`select * from public.admin_ban_user($1, 'Repeated fraud')`, [user7]);
+  assert(ban.rows[0].action_type === 'suspension' && ban.rows[0].ends_at === null, 'ban creates a permanent suspension');
+  const bannedProf = await rideClient.query(`select public.admin_get_user_profile($1) as p`, [user7]);
+  assert(bannedProf.rows[0].p.is_banned === true, 'ban flag set on the profile');
+  await asUser(user7);
+  const bannedCreate = await rideClient.query(`select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 2, 'fixed', 1000, null, null, false, false, 'bus_stop')`,
+    [locJson('Ikeja'), locJson('VI'), locJson('Jibowu'), dep(250)])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof bannedCreate === 'string' && bannedCreate.includes('banned'), 'banned users cannot create rides');
+  const bannedReport = await rideClient.query(`select * from public.report_user($1, 'fraud')`, [user6])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof bannedReport === 'string' && bannedReport.includes('banned'), 'banned users cannot file reports');
+  const pubBanned = await rideClient.query(`select public.get_public_trust_summary($1) as s`, [user7]);
+  assert(pubBanned.rows[0].s.is_banned === true, 'public profile reflects the ban');
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_reactivate_user($1, 'Case verified')`, [user7]);
+  const revived = await rideClient.query(`select public.admin_get_user_profile($1) as p`, [user7]);
+  assert(revived.rows[0].p.is_banned === false && Number(revived.rows[0].p.active_restrictions) === 1, 'reactivation lifts the suspension (warning stays)');
+  await asUser(user7);
+  const frankRide = await createRide('Ikeja', 'VI', 'Jibowu', 260, 2, 'fixed', 1500);
+  assert(typeof frankRide?.id === 'string', 'reactivated users can create rides again');
+
+  // Ride management: search, details, timeline, admin cancellation.
+  await asUser(user5);
+  const p10Ride = await createRide('Ajah', 'Yaba', '3rd Mainland Bridge', 300, 3, 'fixed', 1200);
+  await publishRide(p10Ride.id);
+  await asUser(user2);
+  const deepParse = (v) => {
+    if (typeof v === 'string') { try { return deepParse(JSON.parse(v)); } catch { return v; } }
+    if (Array.isArray(v)) return v.map(deepParse);
+    if (v && typeof v === 'object') { const o = {}; for (const k of Object.keys(v)) o[k] = deepParse(v[k]); return o; }
+    return v;
+  };
+  const jsonbLen = async (v) => Number((await rideClient.query(`select jsonb_array_length($1::jsonb) as n`, [JSON.stringify(deepParse(v))])).rows[0].n);
+  const rideSearch = await rideClient.query(`select * from public.admin_search_rides('Yaba')`);
+  assert(Number(rideSearch.rows[0].total_count) === 1 && rideSearch.rows[0].id === p10Ride.id && rideSearch.rows[0].host_name === 'Dan Example', 'ride search by route');
+  const rideDetails = await rideClient.query(`select public.admin_get_ride_details($1) as d`, [p10Ride.id]);
+  assert(rideDetails.rows[0].d.ride_status === 'published' && rideDetails.rows[0].d.host.display_name === 'Dan Example' && Number(rideDetails.rows[0].d.pending_requests) === 0, 'ride details expose host + state');
+  const rideTl = await rideClient.query(`select * from public.admin_get_ride_timeline($1)`, [p10Ride.id]);
+  assert(rideTl.rows.map((r) => r.event_type).join(',') === 'created,published', 'ride timeline reviewed');
+  const danRelBefore = Number((await rideClient.query(`select public.admin_get_user_profile($1) as p`, [user5])).rows[0].p.trust.reliability_score);
+  await rideClient.query(`select * from public.admin_cancel_ride($1, 'Fraudulent listing')`, [p10Ride.id]);
+  const cancelledDet = await rideClient.query(`select public.admin_get_ride_details($1) as d`, [p10Ride.id]);
+  assert(cancelledDet.rows[0].d.ride_status === 'cancelled', 'admin cancel flips the ride status');
+  const tlAfter = await rideClient.query(`select * from public.admin_get_ride_timeline($1)`, [p10Ride.id]);
+  assert(tlAfter.rows.some((r) => r.event_type === 'cancelled_by_admin'), 'admin cancellations land on the timeline');
+  const danRelAfter = Number((await rideClient.query(`select public.admin_get_user_profile($1) as p`, [user5])).rows[0].p.trust.reliability_score);
+  assert(danRelAfter === danRelBefore, 'admin cancellations never penalize the host');
+  assert((await cnt(user5, 'ride_cancelled')) >= 1, 'cancelled hosts are notified');
+  await asUser(user5);
+  const nonAdminCancel = await rideClient.query(`select * from public.admin_cancel_ride($1, 'x')`, [p10Ride.id])
+    .then(() => null).catch((e) => e.code);
+  assert(nonAdminCancel === '42501', 'ride cancellation is admin-only');
+
+  // Verification review tools + case history.
+  await asUser(user10);
+  const ivanSub = await rideClient.query(
+    `select * from public.submit_verification('government_id', $1, $2, null, null, null, 'national_id')`,
+    [`verification/${user10}/front.png`, `verification/${user10}/back.png`]);
+  await asUser(user2);
+  const vqSearch = await rideClient.query(`select * from public.admin_list_verifications('pending', 'Ivan')`);
+  assert(vqSearch.rowCount === 1 && vqSearch.rows[0].user_id === user10, 'verification queue searchable');
+  const vqType = await rideClient.query(`select * from public.admin_list_verifications('all', null, 'government_id')`);
+  assert(vqType.rowCount >= 1, 'verification type filter');
+  const caseH = (await rideClient.query(`select public.admin_get_case_history($1) as c`, [user5])).rows[0].c;
+  const caseHObj = deepParse(caseH);
+  assert((await jsonbLen(caseHObj.verifications)) >= 1 && (await jsonbLen(caseHObj.rides)) >= 4 && Array.isArray(caseHObj.moderation_actions), 'case history assembles the dossier');
+  await asUser(user8);
+  await rideClient.query(`select * from public.admin_review_verification($1, 'approve')`, [ivanSub.rows[0].id]);
+  await asUser(user10);
+  const ivanVerified = await rideClient.query(`select public.is_user_verified() as v`);
+  assert(ivanVerified.rows[0].v === true, 'moderators approve verification requests');
+
+  // Analytics dashboards (baselines read as postgres to bypass RLS).
+  await rideClient.query('reset role');
+  const base10 = await rideClient.query(`
+    select (select count(*) from public.profiles)::int as users,
+           (select count(*) from public.profiles where verification_status = 'Verified')::int as verified,
+           (select count(*) from public.rides)::int as rides,
+           (select count(*) from public.rides where ride_status = 'completed')::int as completed,
+           (select count(*) from public.reports)::int as reports,
+           (select count(*) from public.outbound_notifications where sent_at is null)::int as pending`);
+  await rideClient.query('set role authenticated');
+  await asUser(user2);
+  const an = (await rideClient.query(`select public.admin_get_analytics() as a`)).rows[0].a;
+  const anObj = deepParse(an);
+  assert(Number(anObj.users.overview.total_users) === base10.rows[0].users, 'user analytics totals match');
+  assert(Number(anObj.users.overview.verified_users) === base10.rows[0].verified, 'verified user count matches');
+  assert((await jsonbLen(anObj.users.daily_registrations)) === 14, 'daily registrations cover 14 days');
+  assert(Number(anObj.rides.overview.total_rides) === base10.rows[0].rides && Number(anObj.rides.overview.completed_rides) === base10.rows[0].completed, 'ride analytics totals match');
+  assert(Number(anObj.safety.reports_submitted) === base10.rows[0].reports, 'safety analytics reports match');
+  assert(Number(anObj.platform.pending_outbound) === base10.rows[0].pending, 'platform analytics delivery queue matches');
+  assert(Number(an.platform.database.database_size_mb) > 0 && Array.isArray(an.platform.storage), 'platform analytics expose db + storage');
+
+  // Monitoring: structured log (server-only) + health probe.
+  await rideClient.query('reset role');
+  await rideClient.query(`select * from public.record_monitoring_event('safety_monitor', 'error', 'deviation detection failed')`);
+  await rideClient.query(`select * from public.record_monitoring_event('outbound_worker', 'info', 'delivery attempt recorded')`);
+  await rideClient.query(`select * from public.record_monitoring_event('safety_monitor', 'error', 'SOS relay retry exhausted')`);
+  await rideClient.query('set role authenticated');
+  await asUser(user2);
+  const h = (await rideClient.query(`select public.get_platform_health() as h`)).rows[0].h;
+  assert(h.status === 'degraded', 'health reports degraded while issues are open');
+  const errCheck = h.checks.find((c) => c.name === 'monitoring_errors_24h');
+  assert(errCheck && errCheck.ok === false && Number(errCheck.detail.split(' ')[0]) === 2, 'health counts monitoring errors');
+  const pendCheck = h.checks.find((c) => c.name === 'outbound_delivery_queue');
+  assert(pendCheck && pendCheck.ok === true, 'delivery queue within limits');
+  assert(Number(h.database_size_mb) > 0, 'health includes database size');
+  const monList = await rideClient.query(`select * from public.admin_list_monitoring_events('error')`);
+  assert(Number(monList.rows[0].total_count) === 2, 'monitoring log filterable by level');
+  await asUser(user9);
+  const badHealth = await rideClient.query(`select * from public.get_platform_health()`)
+    .then(() => null).catch((e) => e.code);
+  assert(badHealth === '42501', 'health checks are admin-only');
+  const deniedAnalytics = await rideClient.query(`select * from public.admin_get_analytics()`)
+    .then(() => null).catch((e) => e.code);
+  assert(deniedAnalytics === '42501', 'analytics are admin-only');
+
+  // Operational config wrapper.
+  await asUser(user2);
+  await rideClient.query(`select * from public.admin_update_safety_config(p_stop_threshold_seconds => 30)`);
+  const cfgTuned = await rideClient.query(`select * from public.get_safety_config()`);
+  assert(cfgTuned.rows[0].stop_threshold_seconds === 30, 'admins tune safety config');
+  await rideClient.query(`select * from public.admin_update_safety_config(p_stop_threshold_seconds => 120)`);
+
+  // Audit log: every action recorded with actor + role, immutable.
+  const auditBan = await rideClient.query(`select * from public.admin_list_audit_log(null, 'user.ban', 'user', $1)`, [user7]);
+  assert(Number(auditBan.rows[0].total_count) === 1 && auditBan.rows[0].actor_user_id === user2 && auditBan.rows[0].actor_role === 'super_admin', 'admin actions are audited with actor + role');
+  const auditAll = await rideClient.query(`select * from public.admin_list_audit_log()`);
+  assert(Number(auditAll.rows[0].total_count) >= 8, 'audit log accumulates every admin action');
+  const auditGina = await rideClient.query(`select * from public.admin_list_audit_log($1, 'verification.review')`, [user8]);
+  assert(Number(auditGina.rows[0].total_count) === 1 && auditGina.rows[0].actor_role === 'moderator', 'moderator actions are audited');
+  const auditCfg = await rideClient.query(`select * from public.admin_list_audit_log(null, 'config.safety_update')`);
+  assert(Number(auditCfg.rows[0].total_count) === 2 && auditCfg.rows[0].old_values.stop_threshold_seconds !== null, 'config changes keep old/new values');
+  await asUser(user5);
+  const auditHidden = await rideClient.query(`select count(*)::int as n from public.admin_audit_log`)
+    .then(() => null).catch((e) => e.code);
+  assert(auditHidden === '42501', 'audit log is invisible to regular users');
+  const auditInsert = await rideClient.query(`insert into public.admin_audit_log (actor_user_id, action) values ($1, 'hack')`, [user5])
+    .then(() => null).catch((e) => e.code);
+  assert(auditInsert === '42501', 'audit log writes flow only through record_audit');
+  const auditUpdate = await rideClient.query(`update public.admin_audit_log set action = 'hack'`)
+    .then(() => null).catch((e) => e.code);
+  assert(auditUpdate === '42501', 'audit log rows are immutable');
+  const auditDelete = await rideClient.query(`delete from public.admin_audit_log`)
+    .then(() => null).catch((e) => e.code);
+  assert(auditDelete === '42501', 'audit log rows cannot be deleted');
+  await asUser(user8);
+  const auditMod = await rideClient.query(`select * from public.admin_list_audit_log()`);
+  assert(Number(auditMod.rows[0].total_count) >= 8, 'moderators read the audit log (audit.view)');
+  const auditModDirect = await rideClient.query(`select count(*)::int as n from public.admin_audit_log`)
+    .then(() => null).catch((e) => e.code);
+  assert(auditModDirect === '42501', 'audit table itself stays locked for moderators');
+
+  // Security hardening: table lockdown + anon surface.
+  await asUser(user5);
+  const rolesHidden = await rideClient.query(`select count(*)::int as n from public.admin_roles`)
+    .then(() => null).catch((e) => e.code);
+  assert(rolesHidden === '42501', 'role tables are invisible to clients');
+  const rpHidden = await rideClient.query(`select count(*)::int as n from public.admin_role_permissions`)
+    .then(() => null).catch((e) => e.code);
+  assert(rpHidden === '42501', 'permission matrix invisible to clients');
+  const adminsHidden = await rideClient.query(`select count(*)::int as n from public.admin_users`)
+    .then(() => null).catch((e) => e.code);
+  assert(adminsHidden === '42501', 'admin membership invisible to clients');
+  const monHidden = await rideClient.query(`select count(*)::int as n from public.monitoring_events`)
+    .then(() => null).catch((e) => e.code);
+  assert(monHidden === '42501', 'monitoring log invisible to clients');
+  const monInsert = await rideClient.query(`insert into public.monitoring_events (source, level, message) values ('x', 'info', 'y')`)
+    .then(() => null).catch((e) => e.code);
+  assert(monInsert === '42501', 'monitoring log is server-write only');
+  const anonGrants = await rideClient.query(`
+    select
+      has_function_privilege('anon', 'public.admin_get_analytics()', 'execute') as anon_analytics,
+      has_function_privilege('anon', 'public.admin_search_users(text,text,text,integer,integer)', 'execute') as anon_users,
+      has_function_privilege('anon', 'public.record_audit(text,text,uuid,jsonb,jsonb,jsonb)', 'execute') as anon_audit,
+      has_function_privilege('anon', 'public.record_monitoring_event(text,text,text,jsonb)', 'execute') as anon_mon,
+      has_function_privilege('anon', 'public.admin_review_verification(uuid,text,text)', 'execute') as anon_ver,
+      has_function_privilege('anon', 'public.admin_cancel_ride(uuid,text)', 'execute') as anon_cancel,
+      has_function_privilege('anon', 'public.get_platform_health()', 'execute') as anon_health,
+      has_function_privilege('anon', 'public.has_permission(text)', 'execute') as anon_perms`);
+  assert(anonGrants.rows[0].anon_analytics === false && anonGrants.rows[0].anon_users === false
+    && anonGrants.rows[0].anon_audit === false && anonGrants.rows[0].anon_mon === false
+    && anonGrants.rows[0].anon_ver === false && anonGrants.rows[0].anon_cancel === false
+    && anonGrants.rows[0].anon_health === false && anonGrants.rows[0].anon_perms === false,
+    'anon is locked out of the entire admin + internal surface');
+  const rlsOn = await rideClient.query(`
+    select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'public'
+       and c.relname in ('admin_roles', 'admin_role_permissions', 'admin_audit_log', 'monitoring_events')
+       and c.relrowsecurity = true`);
+  assert(rlsOn.rows.length === 4, 'RLS enforced on every Phase 10 table');
 
   await rideClient.query('reset role');
   await rideClient.end();
