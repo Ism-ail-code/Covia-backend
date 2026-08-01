@@ -386,6 +386,9 @@ async function main() {
   // ── Phase 5: rides ─────────────────────────────────────────────────
   const rideClient = new Client({ connectionString: `${DSN}/${TEST_DB}` });
   await rideClient.connect();
+  // Deterministic date handling: the JS assertions compare UTC dates, so
+  // the session timezone is pinned to UTC (the server default on Supabase).
+  await rideClient.query(`set timezone to 'UTC'`);
   await rideClient.query(`set role authenticated`);
   const asUser = (id) =>
     rideClient.query(`select set_config('request.jwt.claim.sub', $1, false)`, [id]);
@@ -393,8 +396,13 @@ async function main() {
   const dep = (h) => new Date(t0.getTime() + h * 3600 * 1000).toISOString();
   const createRide = async (origin, dest, pickup, h, seats, fare = 'fixed', fixedFare = null, student = false, women = false) => {
     const r = await rideClient.query(
-      `select * from public.create_ride($1, $2, $3, $4, $5, $6, $7, null, null, $8, $9, null)`,
-      [origin, dest, pickup, dep(h), seats, fare, fixedFare, student, women],
+      `select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, $5, $6, $7, null, null, $8, $9, $10, null, null, null)`,
+      [
+        JSON.stringify({ display_name: origin, latitude: 6.5, longitude: 3.36 }),
+        JSON.stringify({ display_name: dest, latitude: 6.4, longitude: 3.42 }),
+        JSON.stringify({ display_name: pickup, latitude: 6.52, longitude: 3.36 }),
+        dep(h), seats, fare, fixedFare, student, women, 'bus_stop',
+      ],
     );
     return r.rows[0];
   };
@@ -416,7 +424,7 @@ async function main() {
      where table_schema = 'public' and table_name = 'rides'`,
   );
   const rideNames = rideCols.rows.map((c) => c.column_name);
-  for (const col of ['id', 'host_id', 'origin', 'destination', 'pickup_point', 'destination_point', 'origin_lat', 'origin_lng', 'destination_lat', 'destination_lng', 'departure_time', 'estimated_arrival', 'total_seats', 'available_seats', 'fare_mode', 'fixed_fare', 'ride_status', 'is_student_only', 'is_women_only', 'notes', 'created_at', 'updated_at']) {
+  for (const col of ['id', 'host_id', 'origin', 'destination', 'pickup_point', 'destination_point', 'origin_lat', 'origin_lng', 'destination_lat', 'destination_lng', 'origin_loc', 'destination_loc', 'pickup_point_loc', 'destination_point_loc', 'pickup_type', 'visible_at', 'smart_fare_details', 'departure_time', 'estimated_arrival', 'total_seats', 'available_seats', 'fare_mode', 'fixed_fare', 'ride_status', 'is_student_only', 'is_women_only', 'notes', 'created_at', 'updated_at']) {
     assert(rideNames.includes(col), `rides has ${col}`);
   }
   const reqCols = await rideClient.query(
@@ -447,15 +455,15 @@ async function main() {
     `select pg_get_constraintdef(oid) as def from pg_constraint
      where conrelid = 'public.ride_timeline'::regclass and contype = 'c'`,
   );
-  const tlEvents = ['created', 'published', 'requested', 'request_cancelled', 'approved', 'rejected', 'joined', 'left', 'ride_full', 'edited', 'started', 'completed', 'cancelled'];
-  assert(tlEvents.every((e) => tlDef.rows.some((r) => r.def.includes(`'${e}'`))), 'ride_timeline event_type check covers all 13 events');
+  const tlEvents = ['created', 'published', 'requested', 'request_cancelled', 'approved', 'rejected', 'joined', 'left', 'ride_full', 'edited', 'started', 'completed', 'cancelled', 'dropped', 'expired'];
+  assert(tlEvents.every((e) => tlDef.rows.some((r) => r.def.includes(`'${e}'`))), 'ride_timeline event_type check covers all 15 events');
 
   const grants = await rideClient.query(
     `select
-       has_function_privilege('authenticated', 'public.create_ride(text,text,text,timestamptz,integer,text,numeric,text,text,boolean,boolean,timestamptz)', 'execute') as auth_create,
-       has_function_privilege('anon', 'public.create_ride(text,text,text,timestamptz,integer,text,numeric,text,text,boolean,boolean,timestamptz)', 'execute') as anon_create,
+       has_function_privilege('authenticated', 'public.create_ride(jsonb,jsonb,jsonb,timestamptz,integer,text,numeric,text,jsonb,boolean,boolean,text,timestamptz,timestamptz,jsonb)', 'execute') as auth_create,
+       has_function_privilege('anon', 'public.create_ride(jsonb,jsonb,jsonb,timestamptz,integer,text,numeric,text,jsonb,boolean,boolean,text,timestamptz,timestamptz,jsonb)', 'execute') as anon_create,
        has_function_privilege('public', 'public.record_ride_event(uuid,text,uuid,jsonb)', 'execute') as pub_evt,
-       has_function_privilege('authenticated', 'public.search_rides(text,text,date,time,integer,boolean,boolean,text,numeric,numeric,integer,integer)', 'execute') as auth_search`,
+       has_function_privilege('authenticated', 'public.search_rides(text,text,date,time,integer,boolean,boolean,text,numeric,numeric,integer,integer,boolean)', 'execute') as auth_search`,
   );
   assert(grants.rows[0].auth_create === true, 'authenticated can execute create_ride');
   assert(grants.rows[0].anon_create === false, 'anon cannot execute create_ride');
@@ -484,47 +492,48 @@ async function main() {
 
   // Unverified users cannot create rides or request seats.
   await asUser(user2);
+  const locJson = (name) => JSON.stringify({ display_name: name, latitude: 6.5, longitude: 3.36 });
   const unverCreate = await rideClient.query(
-    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 3, 'fixed', 1500)`,
-    [dep(10)],
+    `select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 3, 'fixed', 1500, null, null, false, false, 'bus_stop')`,
+    [locJson('Ikeja'), locJson('VI'), locJson('Jibowu'), dep(10)],
   ).then(() => null).catch((e) => e);
   assert(unverCreate && typeof unverCreate.message === 'string' && unverCreate.message.includes('verified'), 'unverified user cannot create a ride');
 
   // Create validation (verified host).
   await asUser(user1);
   const vPast = await rideClient.query(
-    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 3, 'fixed', 1500)`,
-    [new Date(t0.getTime() - 3600 * 1000).toISOString()],
+    `select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 3, 'fixed', 1500, null, null, false, false, 'bus_stop')`,
+    [locJson('Ikeja'), locJson('VI'), locJson('Jibowu'), new Date(t0.getTime() - 3600 * 1000).toISOString()],
   ).then(() => null).catch((e) => e.message ?? '');
   assert(typeof vPast === 'string' && vPast.includes('future'), 'past departure rejected');
   const vOrigin = await rideClient.query(
-    `select * from public.create_ride('', 'VI', 'Jibowu', $1, 3, 'fixed', 1500)`,
-    [dep(10)],
+    `select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 3, 'fixed', 1500, null, null, false, false, 'bus_stop')`,
+    [locJson(''), locJson('VI'), locJson('Jibowu'), dep(10)],
   ).then(() => null).catch((e) => e.message ?? '');
   assert(typeof vOrigin === 'string' && vOrigin.includes('Origin'), 'empty origin rejected');
   const vSeats = await rideClient.query(
-    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 0, 'fixed', 1500)`,
-    [dep(10)],
+    `select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 0, 'fixed', 1500, null, null, false, false, 'bus_stop')`,
+    [locJson('Ikeja'), locJson('VI'), locJson('Jibowu'), dep(10)],
   ).then(() => null).catch((e) => e.message ?? '');
   assert(typeof vSeats === 'string' && vSeats.includes('between 1 and 10'), 'zero seats rejected');
   const vSeatsBig = await rideClient.query(
-    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 11, 'fixed', 1500)`,
-    [dep(10)],
+    `select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 11, 'fixed', 1500, null, null, false, false, 'bus_stop')`,
+    [locJson('Ikeja'), locJson('VI'), locJson('Jibowu'), dep(10)],
   ).then(() => null).catch((e) => e.message ?? '');
   assert(typeof vSeatsBig === 'string' && vSeatsBig.includes('between 1 and 10'), 'eleven seats rejected');
   const vNoFare = await rideClient.query(
-    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 3, 'fixed', null)`,
-    [dep(10)],
+    `select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 3, 'fixed', null, null, null, false, false, 'bus_stop')`,
+    [locJson('Ikeja'), locJson('VI'), locJson('Jibowu'), dep(10)],
   ).then(() => null).catch((e) => e.message ?? '');
   assert(typeof vNoFare === 'string' && vNoFare.includes('per-seat fare'), 'fixed fare missing rejected');
   const vSmartFare = await rideClient.query(
-    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 3, 'smart', 1500)`,
-    [dep(10)],
+    `select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 3, 'smart', 1500, null, null, false, false, 'bus_stop')`,
+    [locJson('Ikeja'), locJson('VI'), locJson('Jibowu'), dep(10)],
   ).then(() => null).catch((e) => e.message ?? '');
   assert(typeof vSmartFare === 'string' && vSmartFare.includes('Smart fares'), 'smart fare with amount rejected');
   const vStudent = await rideClient.query(
-    `select * from public.create_ride('Ikeja', 'VI', 'Jibowu', $1, 3, 'fixed', 1500, null, null, $2, $3, null)`,
-    [dep(10), true, false],
+    `select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, 3, 'fixed', 1500, null, null, $5, $6, 'bus_stop')`,
+    [locJson('Ikeja'), locJson('VI'), locJson('Jibowu'), dep(10), true, false],
   ).then(() => null).catch((e) => e.message ?? '');
   assert(typeof vStudent === 'string' && vStudent.includes('verified students'), 'student-only ride requires verified student');
 
@@ -963,6 +972,226 @@ async function main() {
   const finalRow = (id) => finalCounters.rows.find((r) => r.id === id);
   assert(Number(finalRow(user1).total_completed_rides) === 1 && Number(finalRow(user1).total_cancelled_rides) === 2, 'host final counters: 1 completed, 2 cancelled');
   assert(Number(finalRow(user2).total_completed_rides) === 1 && Number(finalRow(user2).total_cancelled_rides) === 0, 'passenger final counters: 1 completed, 0 cancelled');
+
+  // ── Phase 5b: structured locations, visibility, expiry, history ──────
+  const loc = (name, lat = 6.5, lng = 3.36, placeId = null, address = null) =>
+    JSON.stringify({
+      display_name: name,
+      latitude: lat,
+      longitude: lng,
+      place_id: placeId,
+      full_address: address,
+    });
+  const createLocRide = async (opts = {}) => {
+    const r = await rideClient.query(
+      `select * from public.create_ride($1::jsonb, $2::jsonb, $3::jsonb, $4, $5, $6, $7, $8, null, $9, $10, $11, $12, null, $13::jsonb)`,
+      [
+        opts.originLoc ?? loc('Ikeja', 6.6018, 3.3515, 'ChIJIkeja', 'Ikeja, Lagos'),
+        opts.destLoc ?? loc('Victoria Island', 6.4281, 3.4219, 'ChIJVI', 'Victoria Island, Lagos'),
+        opts.pickupLoc ?? loc('Jibowu Bus Stop', 6.5216, 3.3608, 'ChIJJibowu', 'Jibowu, Yaba, Lagos'),
+        opts.hours != null ? dep(opts.hours) : dep(36),
+        opts.seats ?? 3,
+        opts.fare ?? 'fixed',
+        opts.fixedFare !== undefined ? opts.fixedFare : 1500,
+        opts.notes ?? null,
+        opts.student ?? false,
+        opts.women ?? false,
+        opts.pickupType !== undefined ? opts.pickupType : 'bus_stop',
+        opts.visibleAt ?? null,
+        opts.smartDetails ?? null,
+      ],
+    );
+    return r.rows[0];
+  };
+
+  await asUser(user1);
+
+  // Structured location creation + pickup rules.
+  const kRow = await createLocRide();
+  const kId = kRow.id;
+  assert(kRow.ride_status === 'draft', 'location create_ride returns a draft');
+  assert(kRow.origin === 'Ikeja' && kRow.pickup_point === 'Jibowu Bus Stop', 'display names extracted to searchable text columns');
+  assert(Number(kRow.origin_lat) === 6.6018 && Number(kRow.origin_lng) === 3.3515, 'coordinates stored from the location object');
+  assert(kRow.origin_loc?.display_name === 'Ikeja' && kRow.pickup_type === 'bus_stop', 'full location object + pickup type stored');
+
+  const noPickupType = await createLocRide({ pickupType: null })
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof noPickupType === 'string' && noPickupType.includes('Pickup must be a main-road point'), 'missing pickup kind rejected');
+  const badPickupType = await createLocRide({ pickupType: 'residential' })
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badPickupType === 'string' && badPickupType.includes('Pickup must be a main-road point'), 'residential pickup kind rejected');
+  const badName = await createLocRide({ originLoc: JSON.stringify({ latitude: 1 }) })
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badName === 'string' && badName.includes('display name'), 'location without a display name rejected');
+  const badCoords = await createLocRide({ originLoc: JSON.stringify({ display_name: 'X', latitude: 'abc' }) })
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badCoords === 'string' && badCoords.includes('coordinates must be numbers'), 'non-numeric coordinates rejected');
+  const fixedWithSmart = await createLocRide({ smartDetails: JSON.stringify({ base_fare: 500 }) })
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof fixedWithSmart === 'string' && fixedWithSmart.includes('only apply to smart fares'), 'smart fare details rejected on a fixed fare');
+
+  // Smart fare: details stored, engine not implemented yet.
+  const mRow = await createLocRide({ fare: 'smart', fixedFare: null, smartDetails: JSON.stringify({ base_fare: 400, per_km: 90 }) });
+  const mId = mRow.id;
+  assert(mRow.fare_mode === 'smart' && mRow.fixed_fare === null, 'smart fare ride created without a fixed amount');
+  assert(mRow.smart_fare_details?.per_km === 90, 'smart fare details payload stored for the future engine');
+
+  // Visibility window: hidden from discovery until released.
+  const nRow = await createLocRide({ hours: 48, visibleAt: dep(40) });
+  const nId = nRow.id;
+  await rideClient.query(`select * from public.publish_ride($1)`, [nId]);
+  const vBad = await createLocRide({ visibleAt: dep(50) })
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof vBad === 'string' && vBad.includes('before the departure'), 'visibility after departure rejected');
+  const vVisPast = await createLocRide({ visibleAt: dep(-1) })
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof vVisPast === 'string' && vVisPast.includes('future'), 'visibility in the past rejected');
+
+  // Publish the structured rides.
+  await rideClient.query(`select * from public.publish_ride($1)`, [kId]);
+  await rideClient.query(`select * from public.publish_ride($1)`, [mId]);
+
+  // Search: visibility gating + verified-host filter + new columns.
+  await asUser(user3);
+  const visSearch = await rideClient.query(
+    `select * from public.search_rides(null, null, null, null, null, null, null, 'departure', null, null, 1, 50, null)`,
+  );
+  assert(!visSearch.rows.some((r) => r.id === nId), 'ride with a future visibility window hidden from search');
+  assert(visSearch.rows.some((r) => r.id === kId && r.pickup_type === 'bus_stop' && r.origin_loc?.display_name === 'Ikeja'), 'search returns structured location columns');
+  await asUser(user2);
+  const visDetail = await rideClient.query(`select * from public.get_ride($1)`, [nId]).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof visDetail === 'string' && visDetail.includes('Ride not found'), 'ride hidden from detail until its visibility window opens (non-host)');
+  const verifiedSearch = await rideClient.query(
+    `select * from public.search_rides(null, null, null, null, null, null, null, null, null, null, 1, 50, true)`,
+  );
+  assert(verifiedSearch.rowCount > 0 && verifiedSearch.rows.every((r) => r.host_verified === true), 'verified-host filter keeps verified hosts');
+  const unverifiedSearch = await rideClient.query(
+    `select * from public.search_rides(null, null, null, null, null, null, null, null, null, null, 1, 50, false)`,
+  );
+  assert(unverifiedSearch.rowCount === 0, 'verified-host filter excludes unverified hosts');
+  await rideClient.query('reset role');
+  await rideClient.query(`update public.rides set visible_at = now() - interval '1 minute' where id = $1`, [nId]);
+  await rideClient.query(`set role authenticated`);
+  await asUser(user3);
+  const visReleased = await rideClient.query(
+    `select * from public.search_rides(null, null, null, null, null, null, null, null, null, null, 1, 50, null)`,
+  );
+  assert(visReleased.rows.some((r) => r.id === nId), 'ride becomes searchable after its visibility window opens');
+
+  // Expiry: past departure without start -> archived as expired.
+  await asUser(user1);
+  const eRow2 = await createLocRide({ hours: 60 });
+  const eId2 = eRow2.id;
+  await rideClient.query(`select * from public.publish_ride($1)`, [eId2]);
+  await asUser(user3);
+  const eReq = await rideClient.query(`select * from public.request_to_join($1)`, [eId2]);
+  await rideClient.query('reset role');
+  await rideClient.query(`update public.rides set departure_time = now() - interval '10 minutes' where id = $1`, [eId2]);
+  await rideClient.query(`set role authenticated`);
+  await asUser(user1);
+  const expiredCount = await rideClient.query(`select public.expire_overdue_rides() as n`);
+  assert(Number(expiredCount.rows[0].n) === 1, 'expire_overdue_rides archives one overdue ride');
+  const expiredRide = await rideClient.query(`select ride_status from public.rides where id = $1`, [eId2]);
+  assert(expiredRide.rows[0].ride_status === 'expired', 'overdue ride archived as expired');
+  assert((await timelineEvents(eId2)).includes('expired'), 'expired timeline event recorded');
+  const expiredReq = await rideClient.query(`select status, responded_at from public.ride_requests where id = $1`, [eReq.rows[0].id]);
+  assert(expiredReq.rows[0].status === 'cancelled' && expiredReq.rows[0].responded_at !== null, 'expiry closes pending requests');
+  await asUser(user3);
+  const expiredSearch = await rideClient.query(
+    `select * from public.search_rides(null, null, null, null, null, null, null, null, null, null, 1, 50, null)`,
+  );
+  assert(!expiredSearch.rows.some((r) => r.id === eId2), 'expired rides excluded from discovery');
+  const expiredDetail = await rideClient.query(`select * from public.get_ride($1)`, [eId2]);
+  assert(expiredDetail.rowCount === 1 && expiredDetail.rows[0].ride_status === 'expired', 'expired ride still readable (history preserved)');
+
+  // Delete draft.
+  await asUser(user1);
+  const oRow = await createLocRide({ hours: 70 });
+  const oId = oRow.id;
+  await asUser(user2);
+  const notHostDelete = await rideClient.query(`select * from public.delete_draft($1)`, [oId])
+    .then(() => null).catch((e) => e.code);
+  assert(notHostDelete === '42501', 'non-host cannot delete a draft');
+  await asUser(user1);
+  const deletePub = await rideClient.query(`select * from public.delete_draft($1)`, [kId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof deletePub === 'string' && deletePub.includes('Only draft rides'), 'published ride cannot be deleted');
+  const delOk = await rideClient.query(`select * from public.delete_draft($1)`, [oId]);
+  assert(delOk.rows[0].delete_draft === true, 'host deletes their draft');
+  const delGone = await rideClient.query(`select * from public.get_ride($1)`, [oId])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof delGone === 'string' && delGone.includes('Ride not found'), 'deleted draft gone from detail');
+
+  // Host removes a passenger before departure.
+  await asUser(user3);
+  const pReq = await rideClient.query(`select * from public.request_to_join($1)`, [kId]);
+  await asUser(user1);
+  await rideClient.query(`select * from public.host_respond_to_request($1, true, null)`, [pReq.rows[0].id]);
+  await asUser(user2);
+  const notHostRemove = await rideClient.query(`select * from public.remove_passenger($1, $2)`, [kId, user3])
+    .then(() => null).catch((e) => e.code);
+  assert(notHostRemove === '42501', 'non-host cannot remove a passenger');
+  await asUser(user1);
+  const removed = await rideClient.query(`select * from public.remove_passenger($1, $2)`, [kId, user3]);
+  assert(Number(removed.rows[0].available_seats) === 3, 'removing a passenger frees the seat');
+  const droppedPart = await rideClient.query(
+    `select left_at from public.ride_participants where ride_id = $1 and user_id = $2`,
+    [kId, user3],
+  );
+  assert(droppedPart.rows[0].left_at !== null, 'removed passenger marked as left');
+  assert((await timelineEvents(kId)).includes('dropped'), 'dropped timeline event recorded');
+  const removeGhost = await rideClient.query(`select * from public.remove_passenger($1, $2)`, [kId, user2])
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof removeGhost === 'string' && removeGhost.includes('not on this ride'), 'removing a non-passenger rejected');
+
+  // Editing with structured fields (legacy 7-arg call still resolves).
+  const editLoc = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, null, null, null, null, null, null, null, $2::jsonb, $3::jsonb, null, null, null)`,
+    [kId, loc('Ikeja Along', 6.6025, 3.3521, 'ChIJIkeja2'), loc('Ajah', 6.47, 3.6, 'ChIJAjah')],
+  );
+  assert(editLoc.rows[0].origin === 'Ikeja Along' && editLoc.rows[0].destination === 'Ajah', 'structured origin/destination editable');
+  assert(editLoc.rows[0].origin_loc?.display_name === 'Ikeja Along', 'location object updated on edit');
+  assert(editLoc.rows[0].ride_status === 'published', 'edit keeps a published ride published');
+  const badTypeEdit = await rideClient.query(
+    `select * from public.update_ride($1, null, null, null, null, null, null, null, null, $2, null, null, null, null, null, null)`,
+    [kId, 'home'],
+  ).then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badTypeEdit === 'string' && badTypeEdit.includes('Pickup must be a main-road point'), 'invalid pickup kind on edit rejected');
+  const legacyEdit = await rideClient.query(
+    `select * from public.update_ride($1, null, null, $2, null, null, null)`,
+    [kId, 'Updated notes'],
+  );
+  assert(legacyEdit.rows[0].notes === 'Updated notes', 'legacy 7-argument update_ride call still works');
+
+  // Ride history.
+  await asUser(user1);
+  const hosted = await rideClient.query(`select * from public.get_ride_history('hosted', null, 1, 50)`);
+  assert(hosted.rowCount > 0 && hosted.rows.every((r) => r.relation === 'hosted'), 'host sees their hosted history');
+  assert(hosted.rows.some((r) => r.ride_status === 'expired') && hosted.rows.some((r) => r.ride_status === 'cancelled') && hosted.rows.some((r) => r.ride_status === 'completed'), 'hosted history covers archived statuses');
+  const hostedCancelled = await rideClient.query(`select * from public.get_ride_history('hosted', 'cancelled', 1, 50)`);
+  assert(hostedCancelled.rowCount > 0 && hostedCancelled.rows.every((r) => r.ride_status === 'cancelled'), 'history status filter works');
+  await asUser(user3);
+  const joined = await rideClient.query(`select * from public.get_ride_history('joined', null, 1, 50)`);
+  assert(joined.rows.every((r) => r.relation === 'joined'), 'passenger sees their joined history');
+  const joinedDep = joined.rows.map((r) => r.departure_time.getTime());
+  assert(joinedDep.every((t, i) => i === 0 || t <= joinedDep[i - 1]), 'history ordered by departure desc');
+  const requested = await rideClient.query(`select * from public.get_ride_history('requested', null, 1, 50)`);
+  assert(requested.rows.every((r) => r.relation === 'requested' && r.request_status !== null), 'request history carries the request status');
+  const reqPending = await rideClient.query(`select * from public.get_ride_history('requested', 'pending', 1, 50)`);
+  assert(reqPending.rows.every((r) => r.request_status === 'pending'), 'request history filtered by request status');
+  const badRelation = await rideClient.query(`select * from public.get_ride_history('watching', null, 1, 50)`)
+    .then(() => null).catch((e) => e.message ?? '');
+  assert(typeof badRelation === 'string' && badRelation.includes('hosted, joined or requested'), 'invalid history relation rejected');
+  const histP1 = await rideClient.query(`select * from public.get_ride_history(null, null, 1, 2)`);
+  const histP2 = await rideClient.query(`select * from public.get_ride_history(null, null, 2, 2)`);
+  assert(histP1.rowCount === 2 && histP2.rowCount === 2 && Number(histP1.rows[0].total_count) === 12, 'history paginates with a stable total_count');
+  const histView = await rideClient.query(`select * from public.ride_history`);
+  assert(histView.rowCount > 0 && histView.rows.every((r) => r.user_id === user3), 'ride_history view only exposes own rows');
+
+  // RLS: expired rides readable via the policy too.
+  await asUser(user2);
+  const expiredViaPolicy = await rideClient.query(`select count(*)::int as n from public.rides where ride_status = 'expired'`);
+  assert(expiredViaPolicy.rows[0].n === 1, 'RLS policy allows reading expired rides');
 
   await rideClient.query('reset role');
   await rideClient.end();
