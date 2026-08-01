@@ -388,6 +388,163 @@ Read side (security definer, `authenticated` only):
 | `get_ride_history(p_relation, p_status, p_page, p_page_size)` | the caller's own history via the `ride_history` security-barrier view — `hosted` / `joined` / `requested` (null = all), optional ride-status filter, paginated with `total_count` |
 | `is_user_verified(p_user_id)` | same gate as `is_user_verified()` but for an arbitrary user (used by `search_rides`' `p_verified_host` filter) |
 
+## Notifications (0017-0018)
+
+### `public.notifications`
+
+Per-user in-app feed. Columns: `id`, `recipient_user_id`, `actor_user_id`,
+`type` (whitelist enforced via `is_valid_notification_type`), `title`,
+`message`, `data` (jsonb — e.g. `{request_id}`), `is_read`, `read_at`,
+`expires_at`, `created_at`. A partial unique index on
+`(recipient_user_id, type, data->>'request_id')` dedupes request-scoped
+events so retries cannot double-notify (a re-request has a new
+`request_id` and notifies normally).
+
+- **RLS** — `SELECT` only for the recipient; there are **no** client
+  `INSERT`/`UPDATE`/`DELETE` grants (every write goes through
+  security-definer RPCs).
+- **Realtime** — the table is published to `supabase_realtime`, so
+  clients receive new rows via `postgres_changes` (RLS narrows the feed
+  to the recipient).
+
+### `public.notification_preferences`
+
+One row per user: `user_id`, `push_enabled`, `email_enabled`,
+`ride_enabled`, `verification_enabled`, `safety_enabled`,
+`marketing_enabled`, `chat_enabled` (added in 0019), `updated_at`.
+`record_notification` maps each type to a category and skips the insert
+when the recipient disabled it (account types like `welcome` always
+deliver; `marketing` defaults to off).
+
+### `public.push_tokens`
+
+`token` (PK), `user_id`, `device_id`, `platform` (`'android'`/`'ios'`),
+`created_at`, `last_seen_at`. Registration only — actual push delivery
+is reserved for a later worker (NestJS or Edge Function).
+
+### Functions
+
+| Function | Purpose |
+| --- | --- |
+| `record_notification(recipient, type, title, message, data?, actor?, expires_at?)` | single entry point for in-app notifications; preference gate + duplicate prevention; **silent-failure isolation is the caller's job** |
+| `broadcast_covia_event(channel, payload)` | real-time event bus — `NOTIFY covia_events` (for the future push worker) + Realtime `broadcast` on `supabase_realtime`; never raises |
+| `handle_account_notifications()` | `auth.users` trigger — signups → `welcome`, email confirmations → `email_verified`; `password_changed` reserved (no SQL hook) |
+| `notify_from_ride_timeline()` | `ride_timeline` trigger emitting `ride_request_*`, `passenger_*`, `ride_*` notifications |
+| `get_notifications(p_page, p_page_size, p_unread_only, p_type)` | paginated feed (newest first, page size ≤ 50), every row carries `total_count` |
+| `get_unread_notification_count()` | unread badge count |
+| `mark_notification_read(p_notification_id)` / `mark_all_notifications_read()` / `delete_notification(p_notification_id)` | feed mutations (returns the updated row / affected count) |
+| `get_notification_preferences()` / `update_notification_preferences(p_push_enabled, p_email_enabled, p_ride_enabled, p_verification_enabled, p_safety_enabled, p_marketing_enabled, p_chat_enabled)` | preferences (all `default null` — only provided values change) |
+| `register_push_token(p_token, p_device_id, p_platform)` / `remove_push_token(p_token)` | device token registry (platform restricted to android/ios, token ≤ 512 chars) |
+
+`submit_verification`, `resubmit_verification` and `admin_review_verification`
+were extended in 0018 to emit `verification_*` notifications (inside
+exception blocks — they never break the primary action).
+
+## Ride chat (0019-0020)
+
+### `public.ride_chats`
+
+One chat per ride: `id` (= `ride_id`, PK), `created_at`, `archived_at`,
+`locked_at`. Auto-created on publish (`ensure_ride_chat` /
+`sync_chat_from_ride_timeline` trigger); archived when the ride ends
+(completed/cancelled/expired); locked 2 hours after archiving.
+
+### `public.chat_messages`
+
+`id`, `chat_id`, `sender_id`, `sender_name`, `message_type`
+(`'text'`/`'image'`), `message`, `media_url`, `sent_at`, `edited_at`,
+`deleted_at` (soft delete), `expires_at` (image-only retention, purged
+by `purge_expired_chat_messages`). Text messages are capped at 2000
+characters.
+
+### `public.message_reads`
+
+Read receipts: `(chat_id, message_id, user_id, read_at)`, PK
+`(message_id, user_id)`. Published to `supabase_realtime` so
+participants see receipts live.
+
+### Functions
+
+| Function | Purpose |
+| --- | --- |
+| `ensure_ride_chat(p_ride_id)` | idempotent chat creation (publish path) |
+| `get_chat(p_chat_id)` | chat + ride join — ride status/locations/departure, host profile, `participant_count` (active passengers + 1) |
+| `get_chat_messages(p_chat_id, p_before, p_page_size)` | newest-first cursor feed; `p_before` = oldest `sent_at` already loaded (null = newest page); every row carries `total_count` |
+| `send_chat_message(p_chat_id, p_message?, p_message_type?='text', p_media_url?)` | participant-only; archived chats rejected, locked chats rejected; text ≤ 2000 chars; images need a `media_url` |
+| `edit_chat_message(p_message_id, p_message)` / `delete_chat_message(p_message_id)` | edit/soft-delete own message |
+| `mark_messages_read(p_chat_id, p_through?)` | receipts up to the given cursor (`null` = all); returns the count read |
+| `search_chat_messages(p_chat_id, p_query, p_page_size)` | ILIKE search over the chat |
+| `add_chat_system_message(...)` | system messages (ride lifecycle) |
+| `broadcast_chat_message(...)` | real-time `broadcast` + `NOTIFY` for each new message |
+| `purge_expired_chat_messages()` | retention cleanup (guarded pg_cron) |
+
+- **RLS** — participants can `SELECT` their chat, messages and read
+  receipts; no client writes.
+- **Realtime** — `chat_messages` + `message_reads` published.
+
+## Safety (0021-0022)
+
+### `public.emergency_contacts`
+
+`id`, `user_id`, `name`, `phone` (validated by `is_valid_phone`),
+`relationship`, `created_at`, `updated_at`. Max 5 per user.
+
+### `public.safety_config`
+
+App-wide safety settings consulted by the monitor: check intervals,
+escalation windows, ride-start monitoring defaults
+(`get_safety_config` / `update_safety_config`).
+
+### `public.safety_events`
+
+`id`, `user_id`, `ride_id`, `type` (`'sos'`/`'check_in'`/`'emergency'`),
+`status` (`'triggered'`/`'pending'`/`'safe'`/`'resolved'`/…),
+`triggered_at`, `responded_at`, `responder`, `acknowledged_at`,
+`acknowledger`. Published to `supabase_realtime` so contacts see
+events live.
+
+### `public.live_locations`
+
+`user_id` (PK), `location` (lat/lng), `accuracy`, `updated_at` —
+throttled upsert (min interval from config), published to
+`supabase_realtime` so trusted contacts can follow the ride.
+
+### `public.ride_monitoring`
+
+One row per monitored ride: `ride_id` (PK), `user_id`, `status`
+(`'active'`/`'suspended'`), start/end points, times. Created by
+`sync_safety_from_ride_timeline` when the ride starts; closed when it
+completes/cancels.
+
+### `public.safety_event_reports` + `public.outbound_notification_queue`
+
+- `safety_event_reports` — incident summaries written when an escalation
+  passes unanswered (what happened, who was notified, outcome).
+- `outbound_notification_queue` — SMS/email jobs for emergency contacts,
+  drained by a future delivery worker; **service-role only**.
+
+### Functions
+
+| Function | Purpose |
+| --- | --- |
+| `trigger_sos()` / `perform_sos()` | SOS from a ride participant; notifies contacts per config |
+| `respond_safety_check(p_event_id, p_safe)` | only the prompted rider; `safe` unlocks via client biometrics; updates event + notifies |
+| `perform_safety_check(p_ride_id)` | monitor-initiated check-in event |
+| `update_live_location(p_location, p_accuracy)` / `stop_live_location()` | throttled live sharing |
+| `set_planned_route(p_start_loc, p_end_loc)` | route for deviation monitoring |
+| `suspend_ride_monitoring()` / `resume_ride_monitoring()` | pause/resume checks (suspended = no events) |
+| `report_safety_incident(p_ride_id, p_message, p_severity)` | manual incident report |
+| `run_safety_monitor()` | periodic sweep — overdue check-ins, SOS escalation, route deviation, timeout; writes `safety_event_reports` + queues contact notifications (guarded pg_cron) |
+| `sync_safety_from_ride_timeline()` | ride `started` → start monitoring (per config); ride end → close |
+| `get_emergency_contacts` / `add_emergency_contact` / `update_emergency_contact` / `delete_emergency_contact` | contact CRUD |
+| `get_safety_config` / `update_safety_config` | settings |
+| `is_active_ride_member(uuid, uuid)` / `assert_ride_member(uuid, uuid)` / `is_valid_phone(text)` / `haversine_m` / `point_segment_distance_m` / `distance_to_route_m` | helpers |
+
+- **RLS** — users manage their own contacts and live location; contacts
+  can `SELECT` the owner's live location + safety events; outbound queue
+  and reports are service-role/admin only.
+- **Realtime** — `live_locations` + `safety_events` published.
+
 ## Mobile model mapping
 
 - `src/types/profile.ts` — `UserProfile` (private) and `PublicProfile`
@@ -414,3 +571,18 @@ Read side (security definer, `authenticated` only):
   (structured locations + pickup rules + visibility window), friendly
   `RideError` mapping. Numeric columns (numeric/bigint) are cast from
   strings.
+- `src/types/notifications.ts` + `src/services/notifications.ts` — feed
+  pages (`AppNotification`, `totalCount`), unread badge, preferences
+  (incl. `chatEnabled`), push-token registration, `postgres_changes`
+  subscription on `notifications`.
+- `src/types/chat.ts` + `src/services/chat.ts` — `Chat` (with
+  `participantCount`), message feed with cursor pagination (`p_before`),
+  send text/image, edit/delete, `markMessagesRead(through)`, search,
+  realtime subscriptions on `chat_messages` + `message_reads`.
+- `src/types/safety.ts` + `src/services/safety.ts` — emergency contacts,
+  safety config, `triggerSos`, biometric-gated `respondSafetyCheck`,
+  live-location sharing with an AsyncStorage offline queue
+  (`covia.safety.liveLocationQueue`, flushed on reconnect), route +
+  monitoring controls, incident report, realtime subscriptions on
+  `live_locations` + `safety_events`, device permission/position/
+  biometric helpers (`expo-location`, `expo-local-authentication`).

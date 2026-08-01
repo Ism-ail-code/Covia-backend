@@ -169,6 +169,94 @@ approved).
 - Boolean — same rule as `is_user_verified()` but for an arbitrary
   user id. Backs the `p_verified_host` search filter.
 
+## Notifications (Phase 6)
+
+### `get_notifications(p_page?, p_page_size?, p_unread_only?, p_type?)`
+- The caller's own feed, newest first. `p_type` filters by type,
+  `p_unread_only` by read state. Pagination like `search_rides` (page
+  size default 20, max 50); every row carries `total_count`.
+
+### `get_unread_notification_count()`
+- Integer — unread rows for the caller.
+
+### `mark_notification_read(p_notification_id)` / `mark_all_notifications_read()` / `delete_notification(p_notification_id)`
+- Feed mutations. Mark-read returns the updated row; mark-all returns
+  the affected count.
+- Errors: not authenticated (28000).
+
+### `get_notification_preferences()` / `update_notification_preferences(p_push_enabled?, p_email_enabled?, p_ride_enabled?, p_verification_enabled?, p_safety_enabled?, p_marketing_enabled?, p_chat_enabled?)`
+- Preferences row (created on first read). Updates coalesce — only
+  provided values change.
+
+### `register_push_token(p_token, p_device_id?, p_platform?)` / `remove_push_token(p_token)`
+- Token registry; `p_platform` must be `'android'` or `'ios'`. Delivery
+  is a later phase. Errors: `P0001` for invalid platform / oversized
+  token.
+
+Realtime: the `notifications` table is published — subscribe with
+`postgres_changes` on `INSERT` (RLS scopes it to the recipient).
+
+## Ride chat (Phase 7)
+
+### `get_chat(p_chat_id)`
+- Chat + ride context (status, locations, departure, host) and
+  `participant_count` (active passengers + 1). Participant-only
+  (42501 otherwise).
+
+### `get_chat_messages(p_chat_id, p_before?, p_page_size?)`
+- Newest-first; `p_before` is the cursor (`sent_at` of the oldest
+  message already loaded; null = newest page). Rows carry `total_count`.
+
+### `send_chat_message(p_chat_id, p_message?, p_message_type?='text', p_media_url?)`
+- Text messages ≤ 2000 characters; images require `p_media_url`.
+- Errors: 42501 (not a participant), archived chat, locked chat,
+  message too long, `P0001` for invalid type (`text`/`image` only).
+
+### `edit_chat_message(p_message_id, p_message)` / `delete_chat_message(p_message_id)`
+- Own messages only; delete is a soft delete. Errors: 42501,
+  "Message not found".
+
+### `mark_messages_read(p_chat_id, p_through?)`
+- Marks everything up to the cursor read (null = all); returns the
+  count newly read.
+
+### `search_chat_messages(p_chat_id, p_query, p_page_size?)`
+- ILIKE search within the chat; rows carry `total_count`.
+
+Realtime: `chat_messages` (INSERT) and `message_reads` (INSERT/UPDATE)
+are published — use `postgres_changes` with a `chat_id=eq.<id>` filter.
+
+## Safety (Phase 8)
+
+### `get_emergency_contacts()` / `add_emergency_contact(p_name, p_phone, p_relationship?)` / `update_emergency_contact(p_contact_id, p_name?, p_phone?, p_relationship?)` / `delete_emergency_contact(p_contact_id)`
+- Contact CRUD (max 5). Phone validated (`P0001` on invalid).
+- Errors: 42501 (not your contact).
+
+### `get_safety_config()` / `update_safety_config(p_* )`
+- Monitor settings (intervals, escalation windows, defaults).
+
+### `trigger_sos()`
+- Creates an SOS event for the caller's active ride (or standalone);
+  notifies emergency contacts per config.
+
+### `respond_safety_check(p_event_id, p_safe)`
+- Only the prompted rider may respond. `p_safe` marks the event safe
+  (client gates it behind a biometric check); unsafe escalates.
+- Errors: 42501 ("Only the rider can respond").
+
+### `update_live_location(p_location, p_accuracy?)` / `stop_live_location()`
+- Throttled upsert of the caller's live location (min interval from
+  config).
+
+### `set_planned_route(p_start_loc, p_end_loc)` / `suspend_ride_monitoring()` / `resume_ride_monitoring()`
+- Route + pause/resume for the caller's active ride.
+
+### `report_safety_incident(p_ride_id, p_message?, p_severity?)`
+- Manual incident report on a ride the caller is on.
+
+Realtime: `live_locations` and `safety_events` are published — contacts
+and riders subscribe via `postgres_changes`.
+
 ## Error conventions
 
 RPCs raise with a friendly `message` and a SQLSTATE `code`:

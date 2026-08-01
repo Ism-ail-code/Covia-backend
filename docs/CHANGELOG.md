@@ -5,6 +5,84 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+### Phase 8 — Safety (emergency contacts, SOS, ride monitoring)
+
+- `supabase/migrations/0021_safety_schema.sql` — `emergency_contacts`
+  (validated phone, max 5/user), `safety_config` (monitor settings),
+  `safety_events` (sos/check_in/emergency lifecycle), `live_locations`
+  (throttled upsert), `ride_monitoring` (active/suspended),
+  `safety_event_reports`, `outbound_notification_queue` (service-role
+  only) + helpers (`is_active_ride_member` — strict passenger-not-left —
+  to avoid clobbering the original `is_ride_member` semantics from 0009,
+  `is_valid_phone`, haversine/route-distance); RLS — users manage their
+  own data, contacts may SELECT the owner's location/events; Realtime
+  publication of `live_locations` + `safety_events`.
+- `supabase/migrations/0022_safety_service.sql` — `trigger_sos` /
+  `perform_sos`, `respond_safety_check` (only the prompted rider; safe
+  unlocks with client biometrics), `perform_safety_check`,
+  `update_live_location`/`stop_live_location`, `set_planned_route`,
+  `suspend_ride_monitoring`/`resume_ride_monitoring`,
+  `report_safety_incident`, `run_safety_monitor` (check-in sweep,
+  SOS escalation, route deviation + timeout detection, incident reports,
+  contact-notification queue — guarded pg_cron),
+  `sync_safety_from_ride_timeline` (ride start/end wiring) + contact
+  CRUD + config RPCs.
+- `scripts/sql-smoke.mjs` — Phase 8 suite: contacts (CRUD + validation),
+  SOS + notifications to contacts, biometric check-in responses, live
+  location upsert + visibility, monitoring lifecycle, escalation
+  (safety_check → emergency → incident report), outbound queue RLS.
+  **534/534 pass** (Phases 1–8).
+- `docs/DATABASE_SCHEMA.md`, `docs/API_DOCUMENTATION.md` — safety
+  tables, RLS, Realtime, RPC reference documented.
+
+### Phase 7 — Ride chat
+
+- `supabase/migrations/0019_chat_schema.sql` — `ride_chats` (one per
+  ride, auto-created on publish, archived on ride end, locked 2h
+  after), `chat_messages` (text ≤ 2000 chars / image with `media_url`,
+  soft delete, image expiry), `message_reads` receipts
+  (PK message_id+user_id); `chat_enabled` preference added to
+  `notification_preferences`; Realtime publication of
+  `chat_messages` + `message_reads`; RLS — participants select-only.
+- `supabase/migrations/0020_chat_service.sql` — `ensure_ride_chat`,
+  `get_chat` (ride + host + `participant_count`), `get_chat_messages`
+  (newest-first cursor pagination, `total_count`),
+  `send_chat_message(p_chat_id, p_message?, p_message_type?, p_media_url?)`,
+  `edit_chat_message`, `delete_chat_message` (soft),
+  `mark_messages_read(p_through)`, `search_chat_messages`,
+  `add_chat_system_message`, `broadcast_chat_message`,
+  `sync_chat_from_ride_timeline` (archive/lock on ride end),
+  `purge_expired_chat_messages` (guarded pg_cron).
+- `scripts/sql-smoke.mjs` — Phase 7 suite: chat creation on publish,
+  participant gating, send/edit/delete rules, cursors + totals,
+  read receipts, search, archive/lock behaviour. Part of the 534 pass.
+- `docs/DATABASE_SCHEMA.md`, `docs/API_DOCUMENTATION.md` — chat
+  tables, RLS, Realtime, RPC reference documented.
+
+### Phase 6 — Notifications
+
+- `supabase/migrations/0017_notifications_schema.sql` —
+  `notifications` feed (21 types, `data` payloads, request-scoped
+  dedupe index), `notification_preferences` (per-category opt-in),
+  `push_tokens` (registration only — delivery is a later phase);
+  `record_notification` (preference gate, silent-skip design),
+  `broadcast_covia_event` (NOTIFY + Realtime broadcast, never raises),
+  `handle_account_notifications` (auth trigger);
+  RLS — select-only for the recipient; Realtime publication of
+  `notifications`.
+- `supabase/migrations/0018_notifications_service.sql` — feed RPCs
+  (`get_notifications` with `total_count`, `get_unread_notification_count`,
+  `mark_notification_read`, `mark_all_notifications_read`,
+  `delete_notification`), preferences + push-token RPCs;
+  `notify_from_ride_timeline` trigger → `ride_*` notifications;
+  `submit_verification`/`resubmit_verification`/`admin_review_verification`
+  extended to emit `verification_*` notifications.
+- `scripts/sql-smoke.mjs` — Phase 6 suite: feed pagination/filters,
+  unread counts, mark-read/delete, preferences gating, push-token
+  platform rules, ride + verification emission. Part of the 534 pass.
+- `docs/DATABASE_SCHEMA.md`, `docs/API_DOCUMENTATION.md` — feed,
+  preferences, tokens, RLS, Realtime, RPC reference documented.
+
 ### Phase 5 — Ride management & matching
 
 - `supabase/migrations/0009_rides_schema.sql` — `rides` (statuses
