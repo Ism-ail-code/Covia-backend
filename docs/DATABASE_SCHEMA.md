@@ -520,7 +520,7 @@ completes/cancels.
 
 - `safety_event_reports` — incident summaries written when an escalation
   passes unanswered (what happened, who was notified, outcome).
-- `outbound_notification_queue` — SMS/email jobs for emergency contacts,
+- `outbound_notifications` — SMS/email jobs for emergency contacts,
   drained by a future delivery worker; **service-role only**.
 
 ### Functions
@@ -544,6 +544,113 @@ completes/cancels.
   can `SELECT` the owner's live location + safety events; outbound queue
   and reports are service-role/admin only.
 - **Realtime** — `live_locations` + `safety_events` published.
+
+## Trust (0023–0026)
+
+### `public.ratings`
+
+`id`, `ride_id`, `rater_user_id`, `ratee_user_id` (must differ),
+`role_of_rater` (`'Host'`/`'Passenger'`), `overall_rating` 1–5,
+`punctuality`/`communication`/`respectfulness`/`reliability` (1–5,
+nullable), `is_revealed`, `revealed_at`, timestamps.
+`unique (ride_id, rater_user_id, ratee_user_id)`.
+
+**Double-blind flow** — one rating per pair per ride, hidden until BOTH
+sides submit (`reveal_reciprocal_ratings` trigger → `reveal_pair_reviews`)
+or the review window from `trust_config` expires
+(`reveal_expired_reviews`, lazy + guarded pg_cron). Revealed ratings are
+immutable; hidden ones can be edited or withdrawn.
+
+### `public.reviews`
+
+`id`, `rating_id` (unique, FK cascade), `ride_id`, `author_user_id`,
+`target_user_id` — ride/author/target are **derived from the parent
+rating** by trigger so they can never disagree. `content` 1–1000 chars,
+`profanity_flag` (set by `is_profane()` stub + after-insert trigger),
+`is_revealed` mirrors the rating.
+
+### `public.reports`
+
+`id`, `reporter_user_id`, `target_type`
+(`'user'`/`'ride'`/`'chat_message'`) + the matching target FK (exactly
+one via CHECK), `reason` (`no_show`, `harassment`, `fake_identity`,
+`dangerous_behavior`, `fraud`, `inappropriate_content`, `other`),
+`details` ≤ 2000, `evidence_refs` jsonb list, `status`
+(`pending`/`under_review`/`resolved`/`dismissed`), `is_confirmed`,
+`resolution_note`, `resolved_by`, `resolved_at`.
+
+Partial unique indexes allow **one pending/under-review report per
+(reporter, target, reason)**; dismissal frees the slot.
+
+### `public.appeals`
+
+`id`, `user_id`, `moderation_action_id`, `reason` ≤ 2000, `status`
+(`pending`/`under_review`/`approved`/`rejected`), `moderator_id`,
+`moderator_note`, `decided_at`. Unique on
+`(user_id, moderation_action_id)` **while pending** — one active appeal
+per action. Warnings cannot be appealed.
+
+### `public.moderation_actions`
+
+`id`, `user_id`, `action_type` (`warning`, `temporary_restriction`,
+`ride_creation_disabled`, `ride_joining_disabled`, `suspension`),
+`severity` 1–4 **generated** from the type, `status`
+(`active`/`lifted`/`expired`/`overturned`), `reason`, `details`,
+`source` (`automatic`/`manual`), `starts_at`/`ends_at`, revoke fields.
+
+**Graduated engine** — `run_moderation_engine` evaluates the
+configurable rules after every reliability event / confirmed report,
+never repeats a severity and escalates to the next one (warning →
+restriction → suspension). Ride creation/joining and rating inserts are
+blocked by BEFORE-INSERT triggers; active restrictions also surface via
+`get_my_moderation_status`.
+
+### `public.reliability_events` + `public.reliability_config`
+
+`reliability_events`: `user_id`, `event_type`, `weight` (snapshot),
+`reason`, `ride_id`, `created_at`. Written by
+`reliability_from_ride_timeline` (completed → every staying rider,
+cancelled → host, left → leaver).
+
+`reliability_config` weights: `ride_completed` +3,
+`ride_cancelled_by_host` −8, `ride_cancelled_by_passenger` −5,
+`no_show` −15, `late_arrival` −5. Score = `clamp(90 + Σ weights, 0, 100)`
+via `recalculate_reliability_score`, stored on `profiles.reliability_score`.
+
+### `public.moderation_rules` + `public.trust_config`
+
+`moderation_rules`: 11 seeded, runtime-tunable thresholds
+(`reliability_below_*`, `no_show_*`, `cancellations_*`,
+`confirmed_reports_*`) each mapping to an action type, severity and
+optional duration. `trust_config`: `review_window_hours` (default 72),
+read by clients through `get_trust_config`. Both private (admin RPCs
+only).
+
+### Functions
+
+| Function | Purpose |
+| --- | --- |
+| `rate_ride(p_ride_id, p_ratee_user_id?, p_overall_rating, p_punctuality?, …, p_comment?)` | submit a rating (integer stars); explicit ratee required when a host rates several passengers; participants only, post-completion, stayed-on-ride |
+| `update_rating(p_rating_id, …)` / `delete_rating(p_rating_id)` | edit/withdraw while hidden |
+| `get_ride_rating_status(p_ride_id)` | what you can rate on a completed ride; your own submission status; never leaks the counterpart's values |
+| `get_user_ratings(p_user_id, p_page, p_page_size)` | revealed ratings + reviews for a profile block |
+| `reveal_pair_reviews` / `reveal_reciprocal_ratings` / `reveal_expired_reviews` / `refresh_profile_rating` | internal (revoked) |
+| `report_user(p_user_id, p_reason, p_details?, p_evidence_refs?)` / `report_ride(p_ride_id, …)` | confidential reports |
+| `get_my_reports(p_page, p_page_size)` | your reports with `total_count` |
+| `submit_appeal(p_moderation_action_id, p_reason)` / `update_appeal(p_appeal_id, p_reason)` / `get_my_appeals()` | appeal an action while pending |
+| `get_my_moderation_status()` | jsonb: `is_suspended`, `can_create_rides`, `can_join_rides`, `restrictions[]` |
+| `get_trust_summary()` / `get_public_trust_summary(uuid)` / `admin_get_trust_summary(uuid)` | private (with report counts) / public subset / admin variants |
+| `get_trust_config()` | review window for countdowns |
+| `admin_list_reports(p_status?)`, `admin_review_report(id, confirm, note?)` | queue + review (confirm → moderation engine) |
+| `admin_list_appeals(p_status?)`, `admin_decide_appeal(id, approve, note?)` | queue + decision (approve lifts the action) |
+| `admin_apply_moderation_action(user, type, reason, hours?)` / `admin_lift_moderation_action(id, reason)` | manual actions (type/severity validated) |
+| `admin_list_moderation_actions(user?, status?)` / `admin_list_moderation_rules()` / `admin_update_moderation_rule(name, threshold?, type?, hours?, enabled?)` / `admin_list_reliability_events(user?)` | admin inspection + tuning |
+
+- **RLS** — revealed ratings: anyone; your own unrevealed submissions:
+  you; everything else: admins. Reports: reporter + admins. Appeals,
+  actions, reliability events: owner + admins. Config tables: no client
+  access at all (owner-only, read via admin RPCs).
+- **Realtime** — `ratings` + `reviews` published (`supabase_realtime`).
 
 ## Mobile model mapping
 
@@ -586,3 +693,11 @@ completes/cancels.
   monitoring controls, incident report, realtime subscriptions on
   `live_locations` + `safety_events`, device permission/position/
   biometric helpers (`expo-location`, `expo-local-authentication`).
+- `src/types/trust.ts` + `src/services/trust.ts` — double-blind rating
+  input (`RatingInput`), `RideRatingStatus` per counterpart,
+  `getUserRatings` profile block, trust summaries (private `TrustSummary`
+  with report counts / public `PublicTrustSummary`), `ModerationStatus`,
+  reports + appeals, `getTrustConfig` review-window countdown; `TrustError`
+  mapping. `src/types/notifications.ts` — `NotificationType` includes the
+  four Phase 9 types (`warning_issued`, `account_restricted`,
+  `appeal_decided`, `report_resolved`).

@@ -5,13 +5,79 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+### Phase 9 — Trust (ratings, reliability, reports, appeals, moderation)
+
+- `supabase/migrations/0023_trust_schema.sql` — `ratings` (one per
+  ride/rater/ratee, double-blind `is_revealed`), `reviews` (1:1 with
+  ratings; ride/author/target derived by trigger; profanity flag
+  infra), `reports` (user/ride/chat_message targets, 7 reasons,
+  partial unique indexes blocking duplicate pending reports),
+  `appeals` (unique per user+action while pending), `moderation_actions`
+  (severity generated from action type), `reliability_events`,
+  `reliability_config` (weights: completed +3, host cancel −8,
+  passenger cancel/leave −5, no-show −15, late −5), `moderation_rules`
+  (11 configurable thresholds, disabled-friendly),
+  `trust_config` (72h review window); RLS — revealed ratings public,
+  own unrevealed submissions only, reports/actions/events owner+admin,
+  config tables private; Realtime publication of `ratings` +
+  `reviews`.
+- `supabase/migrations/0024_ratings_functions.sql` — `rate_ride`
+  (integer stars, explicit `p_ratee_user_id` when the host rates
+  multiple passengers, participants-only, post-completion, 5–1000
+  char reviews), `ride_rateable_targets`, `reveal_pair_reviews` /
+  `reveal_reciprocal_ratings` (instant reveal on reciprocal),
+  `reveal_expired_reviews` (lazy + guarded pg_cron
+  `covia-reveal-expired-reviews`), `get_ride_rating_status` (never
+  leaks the counterpart's submission), `get_user_ratings`,
+  `update_rating`/`delete_rating` (hidden-only; revealed immutable),
+  `refresh_profile_rating` + `sync_profile_rating_on_reveal` trigger.
+- `supabase/migrations/0025_reliability_moderation.sql` —
+  `record_reliability_event`, `recalculate_reliability_score`
+  (90 baseline, clamped 0–100), `reliability_from_ride_timeline`
+  trigger, `run_moderation_engine` (graduated: warning → restriction
+  → suspension, never repeats a severity), creation/joining/rating
+  gates (`assert_ride_creation_allowed`, `assert_ride_joining_allowed`,
+  `assert_not_suspended_on_ratings` — the last also enforced inside
+  `rate_ride`), `expire_moderation_actions` (guarded pg_cron);
+  notification vocabulary extended with `warning_issued`,
+  `account_restricted`, `appeal_decided`, `report_resolved`
+  (`notifications_type_check` + `record_notification` +
+  `is_valid_notification_type` recreated, chat types preserved).
+- `supabase/migrations/0026_trust_service.sql` — `report_user` /
+  `report_ride` (confidential, evidence-ref lists), `get_my_reports`,
+  `submit_appeal` (one pending per action; warnings not appealable) /
+  `update_appeal` / `get_my_appeals`, `get_my_moderation_status`
+  (jsonb: suspended/creation/joining flags + active restrictions),
+  `get_trust_summary` (own) / `get_public_trust_summary` (public
+  subset) / `admin_get_trust_summary`, `get_trust_config`;
+  admin surface — `admin_list_reports`, `admin_review_report`
+  (confirm → engine), `admin_list_appeals`, `admin_decide_appeal`
+  (approve lifts the action), `admin_apply_moderation_action`,
+  `admin_lift_moderation_action`, `admin_list_moderation_actions`,
+  `admin_update_moderation_rule`, `admin_list_moderation_rules`,
+  `admin_list_reliability_events` — all granted to `authenticated`
+  with in-body `is_admin()` gates.
+- `scripts/sql-smoke.mjs` — Phase 9 suite: dan/erin/frank scenario
+  covering schema + grants, double-blind ratings (RLS hides the
+  target's unrevealed rating), instant reciprocal reveal, 72h window
+  expiry, immutability, reliability weights from the timeline,
+  graduated enforcement (warning → temporary restriction → suspension
+  with creation/joining/rating gates), report confidentiality +
+  duplicate slots + dismissal, appeals (edit/reject/approve → lift),
+  manual moderation, trust summaries (own/public/admin), admin queues
+  and RLS over the trust tables. **656/656 pass** (Phases 1–9).
+- `docs/DATABASE_SCHEMA.md`, `docs/API_DOCUMENTATION.md` — trust
+  tables, RLS, engine behaviour and RPC reference documented.
+  (Also corrected the Phase 8 outbound queue table name:
+  `outbound_notifications`, not `outbound_notification_queue`.)
+
 ### Phase 8 — Safety (emergency contacts, SOS, ride monitoring)
 
 - `supabase/migrations/0021_safety_schema.sql` — `emergency_contacts`
   (validated phone, max 5/user), `safety_config` (monitor settings),
   `safety_events` (sos/check_in/emergency lifecycle), `live_locations`
   (throttled upsert), `ride_monitoring` (active/suspended),
-  `safety_event_reports`, `outbound_notification_queue` (service-role
+  `safety_event_reports`, `outbound_notifications` (service-role
   only) + helpers (`is_active_ride_member` — strict passenger-not-left —
   to avoid clobbering the original `is_ride_member` semantics from 0009,
   `is_valid_phone`, haversine/route-distance); RLS — users manage their

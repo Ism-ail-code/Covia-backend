@@ -196,6 +196,11 @@ approved).
 Realtime: the `notifications` table is published — subscribe with
 `postgres_changes` on `INSERT` (RLS scopes it to the recipient).
 
+Phase 9 adds four account-level types — `warning_issued`,
+`account_restricted`, `appeal_decided`, `report_resolved` — always
+delivered (not preference-gated); emitted by the moderation engine and
+moderation RPCs.
+
 ## Ride chat (Phase 7)
 
 ### `get_chat(p_chat_id)`
@@ -256,6 +261,99 @@ are published — use `postgres_changes` with a `chat_id=eq.<id>` filter.
 
 Realtime: `live_locations` and `safety_events` are published — contacts
 and riders subscribe via `postgres_changes`.
+
+## Trust (Phase 9)
+
+### Ratings (double-blind)
+
+### `rate_ride(p_ride_id, p_ratee_user_id?, p_overall_rating, p_punctuality?, p_communication?, p_respectfulness?, p_reliability?, p_comment?)`
+- Stars are **integers 1–5** (safe for PostgREST); comment becomes the
+  review (1–1000 chars).
+- The explicit `p_ratee_user_id` is required when the host rates a ride
+  with several passengers ("Choose which passenger you are rating").
+- Gates: participants only, ride completed, rater stayed on the ride,
+  suspended users blocked, one rating per pair per ride.
+- The returned row has `is_revealed = false`; revealing happens after
+  the insert (reciprocal or window), so re-read the row if you need the
+  final state.
+- Errors: `P0001` ("already rated", "between 1 and 5", "must contain
+  some text", "1000 characters", "after they are completed", "suspended").
+
+### `update_rating(p_rating_id, p_overall_rating, …)` / `delete_rating(p_rating_id)`
+- Only while hidden; revealed ratings are immutable
+  ("no longer be changed"). Owner-only (`42501` "Rating not found").
+
+### `get_ride_rating_status(p_ride_id)`
+- One row per rateable counterpart: `ratee_user_id`, `my_role`,
+  `rating_id` + submitted values (yours only), `is_revealed`,
+  `reciprocal_submitted`, `window_expired`, `review`. Never exposes the
+  counterpart's hidden values.
+
+### `get_user_ratings(p_user_id, p_page?, p_page_size?)`
+- Revealed ratings + reviews for a profile block (newest first,
+  `total_count`).
+
+### `get_trust_config()`
+- `review_window_hours` (default 72) for "rating closes in X" countdowns.
+
+### Reports (confidential)
+
+### `report_user(p_user_id, p_reason, p_details?, p_evidence_refs?)` / `report_ride(p_ride_id, p_reason, p_details?, p_evidence_refs?)`
+- Reasons: `no_show` | `harassment` | `fake_identity` |
+  `dangerous_behavior` | `fraud` | `inappropriate_content` | `other`.
+- `p_evidence_refs` must be a jsonb list. No self-reports; one pending
+  report per (reporter, target, reason).
+- Errors: `P0001` ("cannot report yourself", "not recognised", "must be
+  a list", "already reported", "does not exist").
+
+### `get_my_reports(p_page?, p_page_size?)`
+- The caller's own reports (newest first, `total_count`).
+
+### Appeals
+
+### `submit_appeal(p_moderation_action_id, p_reason)`
+- One pending appeal per action; warnings cannot be appealed; reason
+  1–2000 chars.
+- Errors: `P0001` ("Warnings cannot be appealed", "already have a
+  pending appeal", "no longer active").
+
+### `update_appeal(p_appeal_id, p_reason)` / `get_my_appeals()`
+- Edit while pending (owner-only, `42501` "not found or no longer
+  editable"); list own appeals with action context.
+
+### Moderation status
+
+### `get_my_moderation_status()`
+- jsonb: `is_suspended`, `can_create_rides`, `can_join_rides`,
+  `restrictions[]` (active actions with `action_type`, `severity`,
+  `ends_at`, `source`).
+
+### Trust summaries
+
+### `get_trust_summary()` (own) / `get_public_trust_summary(p_user_id)`
+- Private: average (revealed only), rating count, reliability,
+  completed/cancelled rides, verification badges, confidential report
+  counts, account age, active restrictions. Public subset omits the
+  report counts. Both return a single jsonb column.
+
+### Admin (all `is_admin()`-gated, granted to `authenticated`)
+
+- `admin_list_reports(p_status?)`, `admin_review_report(id, p_confirm, p_note?)`
+  — confirm runs the moderation engine against the target user.
+- `admin_list_appeals(p_status?)`, `admin_decide_appeal(id, p_approve, p_note?)`
+  — approve lifts the action (status `lifted`).
+- `admin_apply_moderation_action(p_user_id, p_action_type, p_reason, p_duration_hours?)`
+  / `admin_lift_moderation_action(p_action_id, p_reason)` — types
+  validated (`warning`…`suspension`); warnings not appealable.
+- `admin_list_moderation_actions(p_user_id?, p_status?)`,
+  `admin_list_moderation_rules()`,
+  `admin_update_moderation_rule(p_rule_name, p_threshold?, p_action_type?, p_duration_hours?, p_enabled?)`,
+  `admin_list_reliability_events(p_user_id?)`.
+- `admin_get_trust_summary(p_user_id)` — full summary for any user.
+- Errors: `P0001` "Admin access required".
+
+Realtime: `ratings` and `reviews` are published (`supabase_realtime`) —
+the client refreshes profile blocks on reveal.
 
 ## Error conventions
 
