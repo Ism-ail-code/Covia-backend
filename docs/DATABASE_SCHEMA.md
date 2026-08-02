@@ -214,7 +214,7 @@ Admin side (security definer, guarded by `is_admin()`, `authenticated` only):
 | Function | Purpose |
 | --- | --- |
 | `is_admin()` | membership check against `admin_users` (used by RLS policies too) |
-| `admin_list_verifications(p_status text default 'pending')` | review queue with `user_email` / `user_display_name` joined in; `'all'` returns everything |
+| `admin_list_verifications(p_status text default 'pending', p_search text, p_verification_type text)` | review queue with `user_email` / `user_display_name` joined in; `'all'` returns everything; optional text search + verification-type filter |
 | `admin_review_verification(p_submission_id, p_action, p_reason)` | `approve` / `reject` / `request_resubmission`; only `pending` rows; approve flips `profiles.verification_status` → `Verified` + the matching `is_government_id_verified` / `is_student_verified` flag; writes audit + notification. Reject requires a reason |
 
 ### Storage (`verification-documents` bucket)

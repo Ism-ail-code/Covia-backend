@@ -50,7 +50,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
   untouched); `notify_from_ride_timeline` ignores unknown event
   types.
 - `supabase/migrations/0031_admin_verification_cases.sql` —
-  `admin_list_verifications(status, search, type, page, page_size)`
+  `admin_list_verifications(status, search, verification_type)`
   (signature changed — old `(text)` overload dropped), `admin_review_verification`
   re-gated + audited, `admin_get_case_history(user_id)` (jsonb
   dossier: verifications, rides, reports, moderation actions).

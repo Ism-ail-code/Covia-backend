@@ -233,30 +233,42 @@ are published — use `postgres_changes` with a `chat_id=eq.<id>` filter.
 
 ## Safety (Phase 8)
 
-### `get_emergency_contacts()` / `add_emergency_contact(p_name, p_phone, p_relationship?)` / `update_emergency_contact(p_contact_id, p_name?, p_phone?, p_relationship?)` / `delete_emergency_contact(p_contact_id)`
-- Contact CRUD (max 5). Phone validated (`P0001` on invalid).
+### `get_emergency_contacts()` / `add_emergency_contact(p_name, p_phone, p_relationship?, p_is_primary?)` / `update_emergency_contact(p_contact_id, p_name?, p_phone?, p_relationship?, p_is_primary?)` / `delete_emergency_contact(p_contact_id)`
+- Contact CRUD (max 5). Phone validated (`P0001` on invalid). One
+  primary contact per user (partial unique index); promoting a contact
+  demotes the previous primary.
 - Errors: 42501 (not your contact).
 
-### `get_safety_config()` / `update_safety_config(p_* )`
+### `get_safety_config()`
 - Monitor settings (intervals, escalation windows, defaults).
+- Mutations are **admin-only** via `admin_update_safety_config`
+  (Phase 10); the raw `update_safety_config` is revoked from clients.
 
-### `trigger_sos()`
-- Creates an SOS event for the caller's active ride (or standalone);
-  notifies emergency contacts per config.
+### `trigger_sos(p_ride_id, p_location?)`
+- Creates an SOS event on the caller's ride; notifies emergency
+  contacts and ride participants per config.
+- Errors: 42501 (not a ride member).
 
-### `respond_safety_check(p_event_id, p_safe)`
-- Only the prompted rider may respond. `p_safe` marks the event safe
-  (client gates it behind a biometric check); unsafe escalates.
-- Errors: 42501 ("Only the rider can respond").
+### `respond_safety_check(p_ride_id, p_safe, p_biometric_confirmed?)`
+- Only the prompted rider may respond. `p_safe` marks the event safe —
+  it is rejected unless the client passes `p_biometric_confirmed`
+  (device biometric/passcode unlock); unsafe escalates immediately.
+- Errors: 42501 ("Only the rider can respond"),
+  `P0001` ("Biometric confirmation is required to dismiss the alert").
 
-### `update_live_location(p_location, p_accuracy?)` / `stop_live_location()`
+### `update_live_location(p_ride_id, p_location)` / `stop_live_location(p_ride_id)`
 - Throttled upsert of the caller's live location (min interval from
-  config).
+  config) on a ride the caller is on.
 
-### `set_planned_route(p_start_loc, p_end_loc)` / `suspend_ride_monitoring()` / `resume_ride_monitoring()`
-- Route + pause/resume for the caller's active ride.
+### `set_planned_route(p_ride_id, p_points)` / `suspend_ride_monitoring(p_ride_id)` / `resume_ride_monitoring(p_ride_id)`
+- Route (polyline of locations) + pause/resume for a ride the caller
+  is on.
 
-### `report_safety_incident(p_ride_id, p_message?, p_severity?)`
+### `get_ride_monitoring(p_ride_id)`
+- Current monitoring row (check pending, escalated) for a ride the
+  caller is on; null when the ride has no monitoring yet.
+
+### `report_safety_incident(p_ride_id, p_message)`
 - Manual incident report on a ride the caller is on.
 
 Realtime: `live_locations` and `safety_events` are published — contacts
@@ -352,8 +364,9 @@ and riders subscribe via `postgres_changes`.
 - `admin_get_trust_summary(p_user_id)` — full summary for any user.
 - Errors: `P0001` "Admin access required".
 
-Realtime: `ratings` and `reviews` are published (`supabase_realtime`) —
-the client refreshes profile blocks on reveal.
+Note: `ratings`/`reviews` are **not** in the `supabase_realtime`
+publication — clients refresh profile/rating blocks on navigation
+focus instead of via `postgres_changes`.
 
 ## Admin dashboard (Phase 10)
 
@@ -408,8 +421,7 @@ the client refreshes profile blocks on reveal.
 
 ### Verification desk (`verification.review`)
 
-- `admin_list_verifications(p_status?, p_search?, p_type?, p_page?,
-  p_page_size?)` — queue with text + document-type filters.
+- `admin_list_verifications(p_status?, p_search?, p_verification_type?)` — queue with text + document-type filters (no pagination; `'all'` status returns everything).
 - `admin_review_verification(p_submission_id, p_action, p_reason?)` —
   approve / reject / request_resubmission (audited).
 - `admin_get_case_history(p_user_id)` — jsonb dossier

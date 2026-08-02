@@ -37,7 +37,7 @@ Manual checklist (SQL Editor):
 | Auth providers | Dashboard → Authentication | Email + password; confirmation + recovery URLs use the `companion://verify` / `companion://reset` deep links |
 | Storage buckets | created by 0004 / 0006 | `avatars` public (5 MB), `verification-documents` **private** (10 MB) |
 | Reviewer / admin accounts | SQL Editor | `insert into public.admin_users (user_id, role_name) values ('<uuid>', 'super_admin');` — one super admin is mandatory (0035 keeps at least one) |
-| Realtime | Database → Replication | Published tables: `rides`, `ride_timeline`, `notifications`, `chat_messages`, `message_reads`, `live_locations`, `safety_events`, `ratings`, `reviews` |
+| Realtime | Database → Replication | Published tables: `rides`, `ride_timeline`, `notifications`, `chat_messages`, `message_reads`, `live_locations`, `safety_events` |
 | pg_cron | Database → Extensions | `pg_cron` (ride expiry, review reveal, moderation expiry, safety monitor); `pg_trgm` (0034 search indexes — the migration skips it when absent) |
 
 ## 3. Verify health & monitoring
