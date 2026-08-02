@@ -927,6 +927,7 @@ async function main() {
   const bRequests = await rideClient.query(`select * from public.get_ride_requests($1)`, [bId]);
   assert(bRequests.rowCount === 2, 'host sees both requests on B');
   assert(bRequests.rows.every((r) => r.passenger_username === 'bob_02'), 'request queue joins passenger profile');
+  assert(bRequests.rows.every((r) => r.ride_id === bId), 'request queue returns ride_id (0038)');
   assert(bRequests.rows.some((r) => r.status === 'cancelled') && bRequests.rows.some((r) => r.status === 'rejected'), 'request queue shows all statuses');
   await asUser(user2);
   const nonHostQueue = await rideClient.query(`select * from public.get_ride_requests($1)`, [bId])
@@ -1071,9 +1072,22 @@ async function main() {
   );
   assert(!visSearch.rows.some((r) => r.id === nId), 'ride with a future visibility window hidden from search');
   assert(visSearch.rows.some((r) => r.id === kId && r.pickup_type === 'bus_stop' && r.origin_loc?.display_name === 'Ikeja'), 'search returns structured location columns');
+  const scalarSearch = visSearch.rows.find((r) => r.id === kId);
+  assert(
+    scalarSearch && Number(scalarSearch.origin_lat) === 6.6018 && Number(scalarSearch.origin_lng) === 3.3515
+      && Number(scalarSearch.destination_lat) === 6.4281 && Number(scalarSearch.destination_lng) === 3.4219,
+    'search_rides returns scalar origin/destination coordinates (0038)',
+  );
   await asUser(user2);
   const visDetail = await rideClient.query(`select * from public.get_ride($1)`, [nId]).then(() => null).catch((e) => e.message ?? '');
   assert(typeof visDetail === 'string' && visDetail.includes('Ride not found'), 'ride hidden from detail until its visibility window opens (non-host)');
+  const scalarDetail = await rideClient.query(`select * from public.get_ride($1)`, [kId]);
+  assert(
+    scalarDetail.rowCount === 1 && Number(scalarDetail.rows[0].origin_lat) === 6.6018
+      && Number(scalarDetail.rows[0].destination_lat) === 6.4281
+      && Number(scalarDetail.rows[0].destination_lng) === 3.4219,
+    'get_ride returns scalar origin/destination coordinates (0038)',
+  );
   const verifiedSearch = await rideClient.query(
     `select * from public.search_rides(null, null, null, null, null, null, null, null, null, null, 1, 50, true)`,
   );
