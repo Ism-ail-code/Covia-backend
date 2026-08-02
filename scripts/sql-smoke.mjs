@@ -2636,6 +2636,71 @@ async function main() {
   const evtRead = await rideClient.query(`select count(*)::int as n from public.reliability_events where user_id = $1`, [user6]);
   assert(evtRead.rows[0].n === 3, 'users read their own reliability events');
 
+  // ── Phase 9b: regression — engine polarity + ride RPC volatility ──
+  // Live E2E (2026-08-02) surfaced two PostgREST-breaking bugs the
+  // suite could not see:
+  //   1. run_moderation_engine compared the reliability score with
+  //      `>=` although the rules mean "drops BELOW X" — a healthy
+  //      score of 90 suspended every new user on the first completed
+  //      ride. With only the reliability rules enabled, a healthy
+  //      score must stay clean and a score below 25 must suspend.
+  //   2. search_rides/get_ride were STABLE while writing through the
+  //      lazy expiry purge; PostgREST runs STABLE RPCs read-only
+  //      (25006) and the old 12-parameter search_rides overload made
+  //      parameterised calls unresolvable (PGRST102). They must now
+  //      be single, VOLATILE overloads.
+  await rideClient.query('reset role');
+  const rulesBefore = await rideClient.query(`select rule_name, enabled from public.moderation_rules order by rule_name`);
+  await rideClient.query(`update public.moderation_rules set enabled = false`);
+  await rideClient.query(`update public.moderation_rules set enabled = true
+    where rule_name in ('reliability_below_warning', 'reliability_below_restrict', 'reliability_critical_suspend')`);
+  const rideProcs = await rideClient.query(`select count(*)::int as n, bool_and(provolatile = 'v') as all_volatile
+    from pg_proc where pronamespace = 'public'::regnamespace and proname in ('search_rides', 'get_ride')`);
+  assert(rideProcs.rows[0].n === 2 && rideProcs.rows[0].all_volatile === true, 'search_rides/get_ride are single volatile overloads (PostgREST-safe)');
+  await rideClient.query('set role authenticated');
+
+  // Healthy score: Erin (91) completes another ride — nothing may fire.
+  await asUser(user6);
+  const h1 = await createRide('Surulere', 'VI', 'Law School', 24, 2, 'fixed', 1200);
+  await publishRide(h1.id);
+  await rideClient.query(`select * from public.start_ride($1)`, [h1.id]);
+  await rideClient.query(`select * from public.complete_ride($1)`, [h1.id]);
+  const erinActions = await rideClient.query(`select count(*)::int as n from public.moderation_actions where user_id = $1`, [user6]);
+  assert(erinActions.rows[0].n === 0, 'a healthy reliability score triggers no automatic action');
+
+  // Low score: 20 completes a ride and must trip the severity-4 suspension.
+  const user11 = crypto.randomUUID();
+  await rideClient.query('reset role');
+  await rideClient.query(`insert into auth.users (id, email, raw_user_meta_data) values ($1, 'lowscore@example.com', '{"full_name":"Low Score"}')`, [user11]);
+  await rideClient.query(`update public.profiles set verification_status = 'Verified' where id = $1`, [user11]);
+  // Score is recalculated as 90 + sum(event weights), so seed a heavy
+  // negative event: 90 - 80 = 10, well below the 25 suspension floor.
+  await rideClient.query(`insert into public.reliability_events (user_id, event_type, weight) values ($1, 'ride_cancelled_by_host', -80)`, [user11]);
+  await rideClient.query(`insert into public.verification_submissions
+    (user_id, verification_type, government_id_kind, front_document_url, status, submitted_at, reviewed_at)
+    values ($1, 'government_id', 'national_id', $2, 'approved', now(), now())`, [user11, `verification/${user11}/front.png`]);
+  await rideClient.query('set role authenticated');
+  await asUser(user11);
+  const l1 = await createRide('Ikeja', 'VI', 'Ojota', 25, 2, 'fixed', 1200);
+  await publishRide(l1.id);
+  await rideClient.query(`select * from public.start_ride($1)`, [l1.id]);
+  await rideClient.query(`select * from public.complete_ride($1)`, [l1.id]);
+  const lowAction = await rideClient.query(`select action_type, severity from public.moderation_actions where user_id = $1 order by created_at desc limit 1`, [user11]);
+  assert(lowAction.rows[0].action_type === 'suspension' && Number(lowAction.rows[0].severity) === 4, 'a score below 25 triggers the severity-4 suspension');
+  // Phase 10 asserts exactly one suspended user (frank), so drop the
+  // synthetic account's action before the harness moves on.
+  await rideClient.query('reset role');
+  await rideClient.query(`delete from public.moderation_actions where user_id = $1`, [user11]);
+  await rideClient.query('set role authenticated');
+
+  // Restore the harness baseline (Phase 9's count rules, reliability
+  // disabled) so Phase 10 runs exactly as before.
+  await rideClient.query('reset role');
+  for (const r of rulesBefore.rows) {
+    await rideClient.query(`update public.moderation_rules set enabled = $2 where rule_name = $1`, [r.rule_name, r.enabled]);
+  }
+  await rideClient.query('set role authenticated');
+
   // ── Phase 10: admin dashboard, RBAC, audit, analytics, monitoring ──
   await rideClient.query('reset role');
   const [user8, user9, user10] = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];

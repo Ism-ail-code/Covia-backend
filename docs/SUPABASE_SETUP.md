@@ -1,6 +1,6 @@
 # Supabase Setup — Authentication & Profiles
 
-The Companion mobile app authenticates directly against **Supabase Auth**
+The Covia mobile app authenticates directly against **Supabase Auth**
 (email + password) using the `@supabase/supabase-js` client. This document
 covers everything needed to go from "placeholder keys" to a working auth
 flow in the app.
@@ -8,7 +8,7 @@ flow in the app.
 ## 1. Create the project
 
 1. Go to <https://supabase.com/dashboard> → **New project** (name e.g.
-   `companion`, region closest to users, strong database password).
+   `covia`, region closest to users, strong database password).
 2. Copy the two public values from **Project Settings → API**:
    - **Project URL** → `EXPO_PUBLIC_SUPABASE_URL`
    - **anon / public key** → `EXPO_PUBLIC_SUPABASE_ANON_KEY`
@@ -33,20 +33,20 @@ flow in the app.
 
 ## 3. Redirect URLs (Authentication → URL Configuration)
 
-The app uses the `companion` URL scheme (see `covia-mobile/app.json`).
+The app uses the `covia` URL scheme (see `covia-mobile/app.json`).
 
 Add the following **Redirect URLs** so confirmation/reset links come back
 into the app (PKCE flow):
 
 ```
-companion://verify
-companion://reset
+covia://verify
+covia://reset
 ```
 
-- The email-confirmation link routes to `companion://verify?code=…` — the
+- The email-confirmation link routes to `covia://verify?code=…` — the
   app exchanges the code for a session via
   `supabase.auth.exchangeCodeForSession`.
-- The password-reset link routes to `companion://reset?code=…`; the same
+- The password-reset link routes to `covia://reset?code=…`; the same
   exchange applies, and the reset screen (future Phase) lets the user pick
   a new password.
 
