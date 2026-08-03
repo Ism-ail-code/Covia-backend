@@ -5,6 +5,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+### Auth & onboarding — phone verification removed (2026-08-03, mobile + docs)
+
+- The phone number is collected as a **required, unverified** contact field
+  during onboarding (register screen) and stored on `public.profiles.phone`.
+  **No schema change** — the column already exists and stays nullable; the
+  signup trigger (0001) still copies `phone` from signup metadata.
+- Email confirmation remains the only account verification method (untouched).
+- Removed from the mobile client: the `"phone"` member of the `Verification`
+  badge type (`src/types/verification.ts`), the Phone verification badge
+  (`src/components/app/Badges.tsx`), and the stale "Email or phone" login
+  label (login is email + password only).
+- Validation is now shared and modular: `PHONE_PATTERN` / `isValidPhone` /
+  `validatePhone` in `src/lib/validation.ts` (reused by emergency contacts).
+  WhatsApp/SMS verification can be added in a future phase on top of
+  `profiles.phone` without refactoring the email flow.
+- Docs: new `AUTH_FLOW.md`, updated `PROJECT_CONTEXT.md`.
+
 ### Phase 10 — Admin dashboard backend (RBAC, user/ride management, analytics, monitoring, hardening)
 
 - `supabase/migrations/0027_admin_rbac.sql` — role-based access control:
