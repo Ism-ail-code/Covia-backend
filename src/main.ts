@@ -35,12 +35,17 @@ async function bootstrap(): Promise<void> {
 
   // ── Security foundations ─────────────────────────────────────────
   app.use(helmet());
+  const configuredOrigins = config
+    .get<string>('CORS_ORIGINS')
+    ?.split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
   app.enableCors({
-    origin:
-      config
-        .get<string>('CORS_ORIGINS')
-        ?.split(',')
-        .map((o) => o.trim()) ?? true,
+    origin: configuredOrigins && configuredOrigins.length > 0
+      ? configuredOrigins
+      : config.get<string>('NODE_ENV') === 'production'
+        ? false
+        : true,
     credentials: true,
   });
 

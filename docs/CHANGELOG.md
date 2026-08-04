@@ -5,6 +5,173 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+### Phase 11 — Closed Beta Launch & Feedback System (2026-08-04)
+
+- **In-app feedback system:**
+  - Created `feedback.tsx` screen with category selection, description, screenshot support
+  - Feedback categories: Bug Report, Feature Request, UI Issue, General Feedback
+  - Automatic device diagnostics attached to every submission
+  - Local storage with Supabase sync when online
+  - Added "Send feedback" link to Settings screen
+
+- **Diagnostics collection:**
+  - Created `src/lib/diagnostics.ts` — auto-collects app version, OS, device model, locale
+  - Attached to bug reports and analytics events
+
+- **Feature flags system:**
+  - Created `src/lib/featureFlags.ts` — simple on/off toggles with AsyncStorage persistence
+  - 10 predefined flags: whatsapp_verification, smart_fare, standby_pool, ai_matching, etc.
+  - Bulk sync support for remote config
+
+- **Remote configuration:**
+  - Created `src/lib/remoteConfig.ts` — centralized config values with 5-min cache
+  - Config keys: maintenance_mode, min_app_version, announcement_*, feedback_enabled, etc.
+  - Version compatibility checking
+
+- **Structured logging:**
+  - Created `src/lib/logger.ts` — debug/info/warn/error levels with AsyncStorage persistence
+  - 500-entry ring buffer, export for bug reports
+  - Configurable minimum log level
+
+- **Release versioning:**
+  - Created `src/lib/version.ts` — semantic versioning helpers from app.json
+  - Display version in Settings (dynamic, not hardcoded)
+  - Version comparison and compatibility checking
+
+- **Beta dashboard:**
+  - Created admin `/beta` route with live metrics
+  - Shows: users, rides, completions, verifications, feedback, bug reports
+  - Auto-refreshes every 30 seconds
+  - Quick actions linking to verification queue, reports, monitoring
+
+- **Documentation generated:**
+  - `BETA_OPERATIONS.md` — operational guide for managing the beta
+  - `SUPPORT_GUIDE.md` — support team guide with common issues and FAQ
+  - `VERSIONING_GUIDE.md` — semantic versioning and build management
+  - `RELEASE_PROCESS.md` — step-by-step release process
+
+### Phase 10 — Closed Beta Preparation, QA & Launch (2026-08-04)
+
+- **Code quality fixes:**
+  - Created `ErrorBoundary` component wrapping root layout — render crashes now show recovery UI instead of white screen
+  - Extracted duplicated `naira` helper to shared `src/lib/format.ts` — removed 7 independent copies across mobile
+  - Removed 3 unused safety service exports (`setPlannedRoute`, `suspendRideMonitoring`, `resumeRideMonitoring`)
+  - Removed dead `types.ts` file (153 lines) from admin console
+  - Removed dead `Brand` component from admin console
+  - Removed dead `configuration.ts` file from backend
+
+- **Accessibility improvements:**
+  - Fixed color contrast: `mutedForeground` darkened (#6a727e → #535d6b) for WCAG AA compliance
+  - Fixed color contrast: `success` darkened (#00a062 → #008a55) for successSoft backgrounds
+  - Fixed color contrast: `destructive` darkened (#db2a3d → #c92031) for destructiveSoft backgrounds
+  - Checkbox: touch target increased (16→20px + hitSlop), added `accessibilityRole="checkbox"` + `accessibilityState`
+  - TopBar back button: touch target increased (40→44px)
+  - BottomNav: added `accessibilityRole="tab"` + `accessibilityState={{ selected }}` + `accessibilityLabel`
+  - Tabs: added `accessibilityRole="tab"` + `accessibilityState={{ selected }}`
+  - Progress: added `accessibilityRole="progressbar"` + `accessibilityState` + `accessibilityValue`
+  - BottomSheet: added `accessibilityViewIsModal` to Modal
+  - Dialog: added `accessibilityViewIsModal` to Modal
+
+- **New abstractions:**
+  - `src/lib/analytics.ts` — Centralized analytics layer with 30+ event definitions, provider interface, dev implementation. Ready for PostHog/Mixpanel/Amplitude integration
+  - `src/lib/crashLogger.ts` — Centralized crash logging with provider interface, global error handler, breadcrumb support. Ready for Sentry/Bugsnag integration
+
+- **Documentation generated:**
+  - `QA_REPORT.md` — Complete end-to-end QA report across all flows
+  - `BUG_FIX_SUMMARY.md` — Summary of all bugs found and fixed
+  - `CODE_CLEANUP_REPORT.md` — Dead code removal and cleanup report
+  - `ACCESSIBILITY_REPORT.md` — Comprehensive accessibility audit
+  - `BETA_TESTING_GUIDE.md` — User-friendly guide for beta testers
+  - `BUG_REPORT_TEMPLATE.md` — Structured template for bug reports
+  - `KNOWN_ISSUES.md` — 12 documented known issues
+  - `RELEASE_NOTES.md` — Version 1.0.0-beta.1 release notes
+  - `TEST_SCENARIOS.md` — 47 test scenarios across 9 categories
+  - `ANALYTICS_ARCHITECTURE.md` — Analytics abstraction documentation
+  - `CRASH_LOGGING_ARCHITECTURE.md` — Crash logging abstraction documentation
+  - `FINAL_PHASE10_REPORT.md` — Comprehensive Phase 10 final report
+
+- **Build verification:** All 3 projects (`covia-mobile`, `covia-backend`, `covia-admin`) compile clean (`tsc --noEmit`)
+
+### Phase 9 — Performance Optimization & Closed Beta Prep (2026-08-04)
+
+- **Mobile performance optimizations:**
+  - Converted `chat.tsx` from `ScrollView`+`.map` to `FlatList` for virtualized message rendering
+  - Converted `notifications.tsx` from `ScrollView`+`.map` to `FlatList` for virtualized notification list
+  - Converted `activity.tsx` from `ScrollView`+`.map` to `FlatList` for virtualized ride history
+  - Converted `explore.tsx` from `ScrollView`+`.map` to `FlatList` for virtualized ride search results
+  - Added `React.memo` to `Bubble`, `NotificationItem`, `HistoryCard`, and `RideCard` components to prevent unnecessary re-renders
+  - Stagger animations now only apply to visible items (FlatList virtualization)
+
+- **Database performance:**
+  - New migration `0041_performance_phase9.sql` with 5 targeted indexes:
+    - `message_reads_message_id_idx` — accelerates chat read-count subqueries
+    - `notifications_data_idx` — GIN index on JSONB data column for ride_id lookups
+    - `rides_search_active_idx` — partial index for active ride search (published/full + visibility)
+    - `ride_participants_member_idx` — covers `is_ride_member()` visibility checks
+    - `verification_submissions_status_submitted_idx` — covers admin verification queue pagination
+
+- **Production build configuration:**
+  - Created `eas.json` with 3 build profiles: development (simulator), preview (internal), production (store)
+  - Updated `app.json` with `ios.bundleIdentifier` and `android.package` (`app.covia.mobile`)
+  - Added `splash` configuration to `app.json` (splash screen during app load)
+  - Created `.env.production` template for production builds
+
+### Phase 8 — Production Security Audit & Hardening (2026-08-04)
+
+- **Security audit (14 tasks completed):**
+  - Task 1: Authentication audit — PKCE flows, session lifecycle, deep link validation
+  - Task 2: Authorization & RBAC audit — 4 roles, 17 permissions, server-side enforcement
+  - Task 3: Supabase RLS audit — 27 tables, 40+ policies, zero client grants on admin tables
+  - Task 4: Database integrity — 40+ FKs, 30+ unique, 40+ check constraints, 40+ indexes
+  - Task 5: RPC security — 95+ functions, all SECURITY DEFINER, parameterized queries
+  - Task 6: Storage security — 3 buckets, 9 storage policies, signed URLs (5-min TTL)
+  - Task 7: API security — Helmet, CORS, rate limiting, validation pipe, safe error responses
+  - Task 8: Input validation — CHECK constraints, PL/pgSQL validation, client-side checks
+  - Task 9: Secrets & environment — .gitignore coverage, no service role key in clients
+  - Task 10: Logging & audit — header redaction, admin audit trail, request ID tracing
+  - Task 11: Dependency audit — 0 critical/high vulnerabilities, moderate Expo transitive
+  - Task 12: Production configuration — CORS lockdown, Swagger disabled, PKCE configured
+  - Task 13: Penetration testing — 14 scenarios, all critical/high blocked
+  - Task 14: Security performance — RLS optimization, indexed policy lookups
+
+- **Security fixes applied:**
+  - Root `.gitignore` created to prevent accidental secret commits
+  - Production CORS blocks all origins if `CORS_ORIGINS` not configured
+  - Admin route guards added to `/standby` and `/tickets` pages
+  - Input `maxLength=500` on all admin free-text fields
+  - Client-side login rate limiting with exponential backoff (mobile + admin)
+  - Database error messages sanitized (no raw PostgreSQL errors to clients)
+
+- **Documentation generated:**
+  - `SECURITY_AUDIT.md` — comprehensive audit report with findings and resolutions
+  - `SECURITY_CHECKLIST.md` — 103-item checklist across 12 categories
+  - `PENETRATION_TEST_REPORT.md` — 14 test scenarios with detailed results
+  - `PRODUCTION_READINESS.md` — scores, requirements, and approval
+  - `KNOWN_LIMITATIONS.md` — deferred features, technical debt, beta limitations
+
+- **Scores:** Security 8.5/10, Production Readiness 8.0/10
+- **Status:** Approved for closed beta deployment
+
+### Phase 7 — Bug Fix & Stabilization Sprint (2026-08-04)
+
+- **Mobile app stabilization:**
+  - Added unmount guards in `activity.tsx` and `ride/[rideId].tsx` to prevent state updates after component unmount (BUG-007, BUG-008)
+  - Removed no-op `useMemo` in `home.tsx` (BUG-010)
+  - Added chip toggle behavior in `explore.tsx` - tapping active chip resets to "All" (BUG-011)
+- **Admin console:**
+  - Fixed `SafetyConfigRow.id` type from `boolean` to `string` (BUG-003)
+  - Split shared reason state in user detail page (BUG-004)
+  - Added `.catch()` handler for unhandled promise rejection in auth (BUG-005)
+  - Removed hardcoded badge counts in app shell (BUG-006)
+- **Documentation:**
+  - Created `STABILIZATION_REPORT.md` with bug fix summary
+  - Created `RELEASE_READINESS.md` with beta readiness checklist
+  - Updated `PROJECT_CONTEXT.md` with Phase 7 status
+- **Build verification:**
+  - All projects compile clean (`tsc --noEmit`)
+  - All projects build successfully
+  - No new lint errors introduced
+
 ### Auth & onboarding — phone verification removed (2026-08-03, mobile + docs)
 
 - The phone number is collected as a **required, unverified** contact field
