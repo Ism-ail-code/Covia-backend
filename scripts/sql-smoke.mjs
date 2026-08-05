@@ -417,11 +417,17 @@ async function main() {
   const selAdmin = await vClient.query(`select name from storage.objects where bucket_id = 'verification-documents'`);
   assert(selAdmin.rowCount === 1, 'admin reads all verification documents');
 
+  // Bucket metadata is readable only as the owner: clients get zero
+  // rows because storage.buckets is RLS-locked (deny by default, 0043).
+  const clientBuckets = await vClient.query(`select id from storage.buckets`);
+  assert(clientBuckets.rowCount === 0, 'clients cannot list buckets (RLS lockdown)');
+
+  await vClient.query('reset role');
   const vBucket = await vClient.query(`select public, file_size_limit from storage.buckets where id = 'verification-documents'`);
   assert(vBucket.rows[0].public === false, 'verification bucket is private');
   assert(Number(vBucket.rows[0].file_size_limit) === 10485760, 'verification bucket size limit');
-
-  await vClient.query('reset role');
+  const bucketsRls = await vClient.query(`select c.relrowsecurity from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'storage' and c.relname = 'buckets'`);
+  assert(bucketsRls.rows[0].relrowsecurity === true, 'storage.buckets RLS enforced');
   await vClient.end();
 
   // ── Phase 5: rides ─────────────────────────────────────────────────
@@ -1142,9 +1148,9 @@ async function main() {
   const eReq = await rideClient.query(`select * from public.request_to_join($1)`, [eId2]);
   await rideClient.query('reset role');
   await rideClient.query(`update public.rides set departure_time = now() - interval '10 minutes' where id = $1`, [eId2]);
+  const expiredCount = await rideClient.query(`select public.expire_overdue_rides() as n`);
   await rideClient.query(`set role authenticated`);
   await asUser(user1);
-  const expiredCount = await rideClient.query(`select public.expire_overdue_rides() as n`);
   assert(Number(expiredCount.rows[0].n) === 1, 'expire_overdue_rides archives one overdue ride');
   const expiredRide = await rideClient.query(`select ride_status from public.rides where id = $1`, [eId2]);
   assert(expiredRide.rows[0].ride_status === 'expired', 'overdue ride archived as expired');
@@ -1498,17 +1504,20 @@ async function main() {
 
   // Helper validation + internal functions stay client-inaccessible.
   await asUser(user2);
-  const vtOk = await rideClient.query(`select public.is_valid_notification_type('ride_request_approved') as v`);
-  assert(vtOk.rows[0].v === true, 'valid notification type accepted');
-  const vtBad = await rideClient.query(`select public.is_valid_notification_type('bogus') as v`);
-  assert(vtBad.rows[0].v === false, 'invalid notification type rejected');
   const directRec = await rideClient.query(`select public.record_notification($1, 'welcome', 'x', 'y')`, [user2])
     .then(() => null).catch((e) => e.code);
   assert(directRec === '42501', 'record_notification is not client-callable');
   const directBcast = await rideClient.query(`select public.broadcast_covia_event('x', '{}')`)
     .then(() => null).catch((e) => e.code);
   assert(directBcast === '42501', 'broadcast_covia_event is not client-callable');
+  const typeLock = await rideClient.query(`select public.is_valid_notification_type('ride_request_approved') as v`)
+    .then(() => null).catch((e) => e.code);
+  assert(typeLock === '42501', 'is_valid_notification_type is not client-callable');
   await rideClient.query('reset role');
+  const vtOk = await rideClient.query(`select public.is_valid_notification_type('ride_request_approved') as v`);
+  assert(vtOk.rows[0].v === true, 'valid notification type accepted (owner context)');
+  const vtBad = await rideClient.query(`select public.is_valid_notification_type('bogus') as v`);
+  assert(vtBad.rows[0].v === false, 'invalid notification type rejected (owner context)');
   const bogusType = await rideClient.query(`select public.record_notification($1, 'not_a_type', 'x', 'y')`, [user4])
     .then(() => null).catch((e) => e.message ?? '');
   await rideClient.query(`set role authenticated`);
@@ -3011,6 +3020,49 @@ async function main() {
        and c.relname in ('admin_roles', 'admin_role_permissions', 'admin_audit_log', 'monitoring_events')
        and c.relrowsecurity = true`);
   assert(rlsOn.rows.length === 4, 'RLS enforced on every Phase 10 table');
+
+  // ── Phase 12: full database lockdown (0043) ──────────────────────────
+  const rlsAll = await rideClient.query(`
+    select count(*)::int as n from pg_tables where schemaname = 'public' and not rowsecurity`);
+  assert(rlsAll.rows[0].n === 0, 'RLS enabled on every public table');
+  const noCreate = await rideClient.query(`
+    select has_schema_privilege('anon', 'public', 'create') as a,
+           has_schema_privilege('authenticated', 'public', 'create') as b`);
+  assert(noCreate.rows[0].a === false && noCreate.rows[0].b === false, 'clients cannot CREATE in schema public');
+  const anonTables = await rideClient.query(`
+    select count(*)::int as n from pg_class c join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'public' and c.relkind in ('r','v','m','p')
+       and has_table_privilege('anon', c.oid, 'select,insert,update,delete')`);
+  assert(anonTables.rows[0].n === 0, 'anon has no table privileges in public');
+  const anonFns = await rideClient.query(`
+    select count(*)::int as n from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'public' and p.prokind = 'f'
+       and has_function_privilege('anon', p.oid, 'execute')`);
+  assert(anonFns.rows[0].n === 0, 'anon has no function privileges in public');
+  const internalFns = [
+    'handle_new_user()', 'set_updated_at()', 'normalize_username()',
+    'handle_account_notifications()', 'notify_from_ride_timeline()',
+    'broadcast_covia_event(text,jsonb)', 'sync_chat_from_ride_timeline()',
+    'broadcast_chat_message()', 'sync_safety_from_ride_timeline()',
+    'is_valid_notification_type(text)', 'expire_overdue_rides()',
+    'expire_moderation_actions()',
+  ];
+  for (const sig of internalFns) {
+    const q = await rideClient.query(`select has_function_privilege('authenticated', 'public.${sig}', 'execute') as ok`);
+    assert(q.rows[0].ok === false, `internal function not client-callable: ${sig}`);
+  }
+  const clientCreate = await rideClient.query(`create table public._lockdown_probe_client (id int)`)
+    .then(() => null).catch((e) => e.code);
+  assert(clientCreate === '42501', 'clients cannot CREATE tables in schema public');
+  await rideClient.query('reset role');
+  await rideClient.query(`drop table if exists public._lockdown_probe`);
+  await rideClient.query(`create table public._lockdown_probe (id int)`);
+  const probe = await rideClient.query(`
+    select count(*)::int as n from information_schema.table_privileges
+     where table_schema = 'public' and table_name = '_lockdown_probe'
+       and grantee in ('anon', 'authenticated')`);
+  assert(probe.rows[0].n === 0, 'new tables get no client grants (default privileges revoked)');
+  await rideClient.query(`drop table public._lockdown_probe`);
 
   await rideClient.query('reset role');
   await rideClient.end();
