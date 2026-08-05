@@ -24,6 +24,11 @@ layer (RBAC, audit, lockdown) as the current security surface.
 5. **Append-only audit** — `admin_audit_log` has no client grants; its
    only writer is security-definer `record_audit()`; rows cannot be
    updated or deleted by any client role (asserted in the smoke suite).
+6. **Internal tables are deny-by-default** — `reserved_usernames` (0042)
+   plus the admin/config/monitoring tables have RLS enabled with zero
+   client grants and zero policies; clients can only reach them through
+   SECURITY DEFINER functions (e.g. `is_username_available()`,
+   `normalize_username()`), never directly.
 
 ## 2. Admin permission matrix (0027)
 
@@ -75,5 +80,5 @@ layer (RBAC, audit, lockdown) as the current security surface.
       alerting
 - [ ] pg_cron schedules (expiry/reveal/moderation/safety) are enabled
 - [ ] RLS is never disabled for public tables; re-run
-      `scripts/sql-smoke.mjs` (725 checks incl. anon lockdown +
-      table revokes) after any schema change
+      `scripts/sql-smoke.mjs` (739 checks incl. anon lockdown +
+      table revokes + reserved_usernames lockdown) after any schema change

@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+### Security — RLS fix for `reserved_usernames` (2026-08-05)
+
+- **Critical fix for Supabase Security Advisor rule `rls_disabled_in_public`:**
+  - `public.reserved_usernames` (internal username lookup) was created in
+    migration 0002 without RLS; combined with Supabase's default grants this
+    made the table readable/writable by anyone with the anon key.
+  - Migration `0042_rls_reserved_usernames.sql` enables RLS (deny by default,
+    no policies), revokes `anon`/`authenticated`/`public` grants, and keeps
+    `FORCE ROW LEVEL SECURITY` off so the SECURITY DEFINER functions
+    `is_username_available()` and `normalize_username()` keep working.
+  - Added 14 regression assertions to `scripts/sql-smoke.mjs` (smoke suite now
+    739 checks) covering the RLS flag, grant revocation and direct-access
+    denial for both client roles.
+  - Added `docs/RLS_AUDIT_REPORT.md` with the full 34-table public-schema audit.
+
 ### Phase 11 — Closed Beta Launch & Feedback System (2026-08-04)
 
 - **In-app feedback system:**
