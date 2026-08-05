@@ -118,6 +118,7 @@ only targets the `public` schema. No storage policy changes required.
 
 ## 8. Commits
 
-- `security: enable RLS on reserved_usernames to fix rls_disabled_in_public`
-- `test(security): assert reserved_usernames is RLS-locked and client-inaccessible`
-- (docs commit for this report / SECURITY.md / CHANGELOG)
+- `security: enable RLS on reserved_usernames to fix rls_disabled_in_public` (0042)
+- `test(security): assert reserved_usernames is RLS-locked and client-inaccessible` (smoke suite, 739 checks)
+- `docs(security): add RLS audit report and update security model + changelog`
+- `docs(security): add deployment guide for the reserved_usernames RLS fix`
