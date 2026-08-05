@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+### Security — Full database lockdown (2026-08-05)
+
+- **Migration `0043_full_database_lockdown.sql`** — Phase 12 hardening pass:
+  - RLS re-asserted on every public table (drift guard).
+  - `REVOKE CREATE ON SCHEMA public` from `anon`, `authenticated`, `public` —
+    clients can no longer create objects.
+  - `ALTER DEFAULT PRIVILEGES` revoked for client roles — future
+    tables/sequences/functions are never auto-granted.
+  - `anon` now has zero table and zero function privileges in `public`
+    (removes pgcrypto/pg_trgm defaults and trigger-helper exposure).
+  - 12 internal cron/trigger helpers are no longer executable by
+    `authenticated` (`handle_new_user`, `set_updated_at`,
+    `normalize_username`, `handle_account_notifications`,
+    `notify_from_ride_timeline`, `broadcast_covia_event`,
+    `sync_chat_from_ride_timeline`, `broadcast_chat_message`,
+    `sync_safety_from_ride_timeline`, `is_valid_notification_type`,
+    `expire_overdue_rides`, `expire_moderation_actions`).
+  - RLS enabled on `storage.buckets` and `storage.objects`.
+  - `service_role` (NestJS backend) and the authenticated RPC surface
+    granted in 0001–0041 are untouched.
+- **Smoke suite now 760 checks** (was 739): cron/system functions are
+  exercised in owner context (matching their pg_cron execution model),
+  plus new lockdown assertions (RLS everywhere, no CREATE, anon zero
+  privileges, internal functions not client-callable, storage RLS,
+  probe-table grants, default privileges).
+- Updated `docs/SECURITY.md`, `docs/RLS_DEPLOYMENT_GUIDE.md`.
+
 ### Security — RLS fix for `reserved_usernames` (2026-08-05)
 
 - **Critical fix for Supabase Security Advisor rule `rls_disabled_in_public`:**

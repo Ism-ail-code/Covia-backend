@@ -29,6 +29,18 @@ layer (RBAC, audit, lockdown) as the current security surface.
    client grants and zero policies; clients can only reach them through
    SECURITY DEFINER functions (e.g. `is_username_available()`,
    `normalize_username()`), never directly.
+7. **Full database lockdown (0043)** — the database-wide hardening pass:
+   - RLS re-asserted on **every** public table (drift guard)
+   - `CREATE` revoked on schema `public` from `anon`/`authenticated`/`PUBLIC`
+   - default privileges revoked, so new tables/functions/sequences are
+     never auto-granted to client roles
+   - `anon` has **zero** table and **zero** function privileges in `public`
+     (removes the pgcrypto/pg_trgm defaults and trigger-helper exposure)
+   - internal cron/trigger helpers are not executable by `authenticated`
+     (`handle_new_user`, `normalize_username`, `run_safety_monitor`,
+     `expire_*`, `reveal_*`, `is_valid_notification_type`, …) — they run
+     only via triggers or pg_cron as the owner
+   - RLS enforced on `storage.buckets` and `storage.objects`
 
 ## 2. Admin permission matrix (0027)
 
@@ -80,5 +92,6 @@ layer (RBAC, audit, lockdown) as the current security surface.
       alerting
 - [ ] pg_cron schedules (expiry/reveal/moderation/safety) are enabled
 - [ ] RLS is never disabled for public tables; re-run
-      `scripts/sql-smoke.mjs` (739 checks incl. anon lockdown +
-      table revokes + reserved_usernames lockdown) after any schema change
+      `scripts/sql-smoke.mjs` (760 checks incl. anon lockdown,
+      table revokes, reserved_usernames lockdown + full DB lockdown)
+      after any schema change
