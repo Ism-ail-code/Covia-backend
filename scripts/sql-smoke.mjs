@@ -192,6 +192,34 @@ async function main() {
   assert(avail.rows[0].free === true, 'fresh username available');
   assert(avail.rows[0].reserved === false, 'reserved username unavailable');
 
+  // ── RLS on reserved_usernames (Security Advisor rls_disabled_in_public) ──
+  const reservedRls = await client.query(`
+    select c.relrowsecurity from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'public' and c.relname = 'reserved_usernames'`);
+  assert(reservedRls.rows[0].relrowsecurity === true, 'RLS enabled on reserved_usernames');
+
+  const reservedGrants = await client.query(`
+    select count(*)::int as n from information_schema.table_privileges
+    where table_schema = 'public' and table_name = 'reserved_usernames'
+      and grantee in ('anon', 'authenticated')`);
+  assert(reservedGrants.rows[0].n === 0, 'no client grants on reserved_usernames');
+
+  const clientProbe = async (role, stmt) => {
+    await client.query(`set role ${role}`);
+    const code = await client.query(stmt).then(() => null).catch((e) => e.code);
+    await client.query('reset role');
+    return code;
+  };
+  for (const role of ['anon', 'authenticated']) {
+    const sel = await clientProbe(role, 'select * from public.reserved_usernames');
+    assert(sel === '42501', `${role} cannot select reserved_usernames directly`);
+    const ins = await clientProbe(role, `insert into public.reserved_usernames (name) values ('rogue')`);
+    assert(ins === '42501', `${role} cannot insert into reserved_usernames`);
+    const del = await clientProbe(role, `delete from public.reserved_usernames where name = 'admin'`);
+    assert(del === '42501', `${role} cannot delete from reserved_usernames`);
+  }
+
   // â”€â”€ Emergency contacts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   await client.query(
     `update public.profiles set
