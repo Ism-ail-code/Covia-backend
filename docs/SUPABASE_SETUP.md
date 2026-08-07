@@ -25,11 +25,35 @@ flow in the app.
 ## 2. Auth settings (Authentication → Sign In / Providers)
 
 - **Email → Enable "Email signups"** — required for registration.
-- **Email → Confirm email** — **ON** (the app's registration flow is built
-  around email confirmation: signup without a session routes to the
-  "verify your email" screen).
+- **Email → Confirm email** — **ON** (registration stays gated on email
+  verification; unverified logins are routed to the OTP screen).
 - **Password policy** (optional, app already validates client-side):
   8+ chars with upper/lower/digit/symbol.
+
+### Email OTP (Phase 10)
+
+The app verifies signups with a **6-digit OTP typed inside the app**
+instead of an email link. To make Supabase send the numeric code:
+
+1. **Authentication → Templates → Magic Link / OTP**.
+2. Replace the link variable with the code variable in the email body
+   (keep `{{ .SiteURL }}` / branding as you like):
+
+   ```
+   Your Covia verification code is: {{ .Token }}
+   ```
+
+3. `{{ .Token }}` is a 6-digit code; the default expiry is 1 hour and
+   requests are throttled to one per 60 seconds server-side (both
+   configurable under **Authentication → Sign In / Providers → Email**).
+
+### Google Sign-In (Phase 10)
+
+1. Create OAuth client IDs in Google Cloud Console (Web + Android +
+   iOS) — see `covia-mobile/docs/GOOGLE_SIGNIN_SETUP.md`.
+2. **Authentication → Providers → Google** → enable and paste the
+   **Web client ID** (validates `signInWithIdToken`). Native sign-in
+   needs no redirect URLs.
 
 ## 3. Redirect URLs (Authentication → URL Configuration)
 
@@ -45,7 +69,9 @@ covia://reset
 
 - The email-confirmation link routes to `covia://verify?code=…` — the
   app exchanges the code for a session via
-  `supabase.auth.exchangeCodeForSession`.
+  `supabase.auth.exchangeCodeForSession`. (Phase 10: signups now verify
+  with a 6-digit OTP in-app instead; the link path is retained for
+  backwards compatibility.)
 - The password-reset link routes to `covia://reset?code=…`; the same
   exchange applies, and the reset screen (future Phase) lets the user pick
   a new password.
