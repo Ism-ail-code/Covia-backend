@@ -25,10 +25,13 @@ create index if not exists notifications_data_idx
 -- =============================================================
 -- search_rides filters on ride_status IN ('published','full')
 -- and visible_at. A partial index covers only active rides.
+-- (visible_at <= now() is deliberately NOT in the predicate —
+-- now() is STABLE, which Postgres forbids in index predicates.
+-- visible_at is indexed as a column instead and the query's
+-- own filter still narrows the result set.)
 create index if not exists rides_search_active_idx
-  on public.rides (departure_time asc, created_at desc)
-  where ride_status in ('published', 'full')
-    and (visible_at is null or visible_at <= now());
+  on public.rides (departure_time asc, created_at desc, visible_at)
+  where ride_status in ('published', 'full');
 
 -- =============================================================
 -- 4. Ride participant lookup for is_ride_member()

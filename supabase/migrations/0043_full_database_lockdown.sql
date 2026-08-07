@@ -16,10 +16,7 @@
 --   6. Revokes EXECUTE on internal-only helper/cron/trigger functions
 --      from authenticated (clients never call these; the mobile and
 --      admin apps only call the RPC surface granted in 0001-0041).
---   7. Re-asserts RLS on storage.objects and enables it on
---      storage.buckets (matches Supabase's default posture; client
---      object access remains governed by the bucket policies from
---      0004/0006).
+--   7. Storage RLS (see note below — cannot be altered from migrations).
 --
 -- Deliberately NOT done (documented in SECURITY.md):
 --   * service_role grants untouched - reserved for the NestJS backend.
@@ -102,7 +99,11 @@ revoke execute on function
   from authenticated;
 
 -- =============================================================
--- 7. Storage: RLS enforced on buckets and objects
+-- 7. Storage: RLS on buckets and objects
 -- =============================================================
-alter table storage.buckets enable row level security;
-alter table storage.objects enable row level security;
+-- Hosted Supabase owns the storage schema (supabase_storage_admin);
+-- `alter table storage.*` fails with 42501 (must be owner) from any
+-- migration. RLS is already enabled on storage.buckets AND
+-- storage.objects by the platform (verified: relrowsecurity = true
+-- for both), and object access is governed by the bucket policies
+-- from 0004/0006. Nothing to do here.
